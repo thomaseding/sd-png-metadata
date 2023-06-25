@@ -22,9 +22,10 @@ import qualified Codec.Picture.Metadata as J
 import Control.Exception (assert, evaluate)
 import Control.Monad (foldM, when, (<=<))
 import qualified Data.ByteString.Lazy.Char8 as BS
-import Data.List (foldl', intercalate, stripPrefix)
+import Data.List (foldl', intercalate, sort, stripPrefix)
 import Data.List.Split (splitOn)
 import Data.Maybe (catMaybes)
+import GHC.IO.Encoding (setLocaleEncoding, utf8)
 import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
@@ -44,6 +45,7 @@ data Key
   | KeySampler
   | KeyCFGScale
   | KeySeed
+  | KeyFaceRestoration
   | KeySize
   | KeyModelHash
   | KeyModel
@@ -61,6 +63,7 @@ keyToText key = case key of
   KeySampler -> "Sampler"
   KeyCFGScale -> "CFG scale"
   KeySeed -> "Seed"
+  KeyFaceRestoration -> "Face restoration"
   KeySize -> "Size"
   KeyModelHash -> "Model hash"
   KeyModel -> "Model"
@@ -76,6 +79,7 @@ data SDMetadata = SDMetadata
   , sdSampler :: String
   , sdCfgScale :: Int
   , sdSeed :: Int
+  , sdFaceRestoration :: String
   , sdSize :: (Int, Int)
   , sdModelHash :: String
   , sdModel :: String
@@ -95,6 +99,7 @@ emptySdMetadata =
     , sdSampler = ""
     , sdCfgScale = 0
     , sdSeed = 0
+    , sdFaceRestoration = ""
     , sdSize = (0, 0)
     , sdModelHash = ""
     , sdModel = ""
@@ -122,20 +127,20 @@ stripSdExtension :: String -> Maybe (String, SDExtension)
 stripSdExtension = \case
   '<' : rest ->
     let (name, rest') = spanItem rest
-     in Just $ go [name] rest'
+     in go [name] rest'
   _ -> Nothing
  where
   spanItem = span (`notElem` (":>" :: String))
 
-  go :: [String] -> String -> (String, SDExtension)
+  go :: [String] -> String -> Maybe (String, SDExtension)
   go acc = \case
     ':' : argBegin ->
       let (arg, rest) = spanItem argBegin
        in go (arg : acc) rest
     '>' : rest ->
       let name : args = reverse $ map trim acc
-       in (rest, SDExtension name args)
-    rest -> error $ "stripSdExtension: invalid SD extension syntax -- " ++ show rest
+       in Just (rest, SDExtension name args)
+    _ -> Nothing
 
 -- Removes the extension encoding from the input string and returns the extensions.
 extractSdExtensions :: String -> (String, [SDExtension])
@@ -156,6 +161,19 @@ trim = f . f
 trimHeavy :: String -> String
 trimHeavy = unwords . words
 
+massageLines :: String -> String
+massageLines = go
+ where
+  go = \case
+    ' ' : '\n' : rest -> go $ '\n' : rest
+    '\n' : ' ' : rest -> go $ '\n' : rest
+    ' ' : ',' : rest -> go $ ',' : rest
+    '\n' : ',' : rest -> ',' : go rest
+    '\n' : '<' : rest -> '<' : go rest
+    ',' : '\n' : rest -> ',' : ' ' : go rest
+    c : rest -> c : go rest
+    [] -> []
+
 parseSdMetadata :: String -> SDMetadata
 parseSdMetadata text = foldl' accumSdMetadata emptySdMetadata theLines
  where
@@ -170,6 +188,7 @@ accumSdMetadata sd theLine = case theLine of
   (goEntry KeySampler -> Just entry) -> sd{sdSampler = sdValue entry}
   (goEntry KeyCFGScale -> Just entry) -> sd{sdCfgScale = read $ sdValue entry}
   (goEntry KeySeed -> Just entry) -> sd{sdSeed = read $ sdValue entry}
+  (goEntry KeyFaceRestoration -> Just entry) -> sd{sdFaceRestoration = sdValue entry}
   (goEntry KeySize -> Just entry) -> sd{sdSize = readSize $ sdValue entry}
   (goEntry KeyModelHash -> Just entry) -> sd{sdModelHash = sdValue entry}
   (goEntry KeyModel -> Just entry) -> sd{sdModel = sdValue entry}
@@ -180,7 +199,7 @@ accumSdMetadata sd theLine = case theLine of
   -- KeyPositivePrompt is not keyed by string, so we have to do this special case
   _ -> case sdPositivePrompt sd of
     ("", []) -> sd{sdPositivePrompt = extractSdExtensions theLine}
-    _ -> error $ "parse error: " ++ theLine ++ " is not a valid SD metadata entry"
+    _ -> error $ "parse error: " ++ show theLine ++ " is not a valid SD metadata entry"
  where
   goEntry = parseSdMetadataEntry . keyToText
 
@@ -210,35 +229,38 @@ inlineSdExtensions (text, exts) = text ++ concatMap inlineSdExtension exts
   inlineSdExtension (SDExtension name args) = " <" ++ name ++ concatMap (':' :) args ++ ">"
 
 toParameters :: SDMetadata -> (J.Keys J.Value, J.Value)
-toParameters sd = (key, value)
+toParameters sd = (J.Unknown "parameters", value)
  where
-  key = J.Unknown "parameters"
-  showKey = (++ ": ") . keyToText
+  showKey key str = Just $ keyToText key ++ ": " ++ str
   value =
     J.String $
       unlines $
         catMaybes
           [ Just $ inlineSdExtensions $ sdPositivePrompt sd
-          , Just $ showKey KeyNegativePrompt ++ inlineSdExtensions (sdNegativePrompt sd)
+          , showKey KeyNegativePrompt $ inlineSdExtensions (sdNegativePrompt sd)
           , Just $ intercalate ", " commaDelimJunk
           , if null $ sdPositiveTemplate sd
               then Nothing
-              else Just $ showKey KeyTemplate ++ inlineSdExtensions (sdPositiveTemplate sd)
+              else showKey KeyTemplate $ inlineSdExtensions (sdPositiveTemplate sd)
           , if null $ sdNegativeTemplate sd
               then Nothing
-              else Just $ showKey KeyNegativeTemplate ++ inlineSdExtensions (sdNegativeTemplate sd)
+              else showKey KeyNegativeTemplate $ inlineSdExtensions (sdNegativeTemplate sd)
           ]
   commaDelimJunk =
-    [ showKey KeySteps ++ show (sdSteps sd)
-    , showKey KeySampler ++ sdSampler sd
-    , showKey KeyCFGScale ++ show (sdCfgScale sd)
-    , showKey KeySeed ++ show (sdSeed sd)
-    , showKey KeySize ++ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
-    , showKey KeyModelHash ++ sdModelHash sd
-    , showKey KeyModel ++ sdModel sd
-    , showKey KeyLoraHashes ++ intercalate "," (map (\(k, v) -> k ++ ": " ++ v) $ sdLoraHashes sd)
-    , showKey KeyVersion ++ sdVersion sd
-    ]
+    catMaybes
+      [ showKey KeySteps $ show (sdSteps sd)
+      , showKey KeySampler $ sdSampler sd
+      , showKey KeyCFGScale $ show (sdCfgScale sd)
+      , showKey KeySeed $ show (sdSeed sd)
+      , case sdFaceRestoration sd of
+          "" -> Nothing
+          face -> showKey KeyFaceRestoration face
+      , showKey KeySize $ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
+      , showKey KeyModelHash $ sdModelHash sd
+      , showKey KeyModel $ sdModel sd
+      , showKey KeyLoraHashes $ intercalate "," (map (\(k, v) -> k ++ ": " ++ v) $ sdLoraHashes sd)
+      , showKey KeyVersion $ sdVersion sd
+      ]
 
 prettySdMetadata :: SDMetadata -> String
 prettySdMetadata sd =
@@ -250,6 +272,9 @@ prettySdMetadata sd =
       , showKey KeySampler $ sdSampler sd
       , showKey KeyCFGScale $ show (sdCfgScale sd)
       , showKey KeySeed $ show (sdSeed sd)
+      , case sdFaceRestoration sd of
+          "" -> Nothing
+          face -> showKey KeyFaceRestoration face
       , showKey KeySize $ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
       , showKey KeyModelHash $ sdModelHash sd
       , showKey KeyModel $ sdModel sd
@@ -494,7 +519,8 @@ doSingle opts single = do
       case parameters of
         Nothing -> putStrLn "No parameters metadata found"
         Just (J.String text) -> do
-          let sd = parseSdMetadata text
+          let text' = massageLines text
+          let sd = parseSdMetadata text'
           when (optPrint opts) do
             putStrLn $ prettySdMetadata sd
           let sd' = foldr editSdMetadata sd (optEdit opts)
@@ -535,7 +561,7 @@ doBatch opts = do
       Nothing -> pure ()
       Just path -> createDirectoryIfMissing True path
   inputFiles <- listDirectory $ optInputImage opts
-  let inputFiles' = filter isPng inputFiles
+  let inputFiles' = sort $ filter isPng inputFiles
   let count = length inputFiles'
   let doOne inputFile index = do
         let inputBase = takeBaseName inputFile
@@ -568,6 +594,7 @@ doNonBatch opts = do
 
 main :: IO ()
 main = do
+  setLocaleEncoding utf8
   fmap parseCliOpts getArgs >>= validateBatch >>= \case
     Left err -> do
       putStrLn err

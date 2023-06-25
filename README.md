@@ -26,6 +26,7 @@ Supported keys:
   "Sampler"
   "CFG scale"
   "Seed"
+  "Face restoration"
   "Size"
   "Model hash"
   "Model"
