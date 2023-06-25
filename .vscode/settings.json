@@ -1,0 +1,24 @@
+{
+  "cSpell.words": [
+    "accum",
+    "canonicalize",
+    "concat",
+    "Delim",
+    "fmap",
+    "foldl",
+    "foldr",
+    "HLINT",
+    "Karras",
+    "majicmix",
+    "Metadatas",
+    "metas",
+    "pixelart",
+    "RGBA",
+    "Semigroup",
+    "uncurry",
+    "unlines",
+    "unrecognised",
+    "unwords"
+  ],
+  "editor.tabSize": 2
+}
