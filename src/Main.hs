@@ -5,6 +5,7 @@
 
 {-# HLINT ignore "Redundant fmap" #-}
 {-# HLINT ignore "Redundant pure" #-}
+{-# HLINT ignore "Use forM_" #-}
 {-# HLINT ignore "Use if" #-}
 
 module Main (main) where
@@ -24,9 +25,10 @@ import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.List (foldl', intercalate, stripPrefix)
 import Data.List.Split (splitOn)
 import Data.Maybe (catMaybes)
-import System.Directory (doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
+import System.FilePath (takeBaseName, takeDirectory, takeExtension, (</>))
 
 -- SD metadata format:
 --
@@ -103,7 +105,7 @@ emptySdMetadata =
     }
 
 data SDMetadataEntry = SDMetadataEntry
-  { sdKey :: String -- positivePrompt uses empty string as key
+  { sdKey :: String
   , sdValue :: String -- trimmed of leading and trailing whitespace
   }
   deriving (Show)
@@ -175,6 +177,7 @@ accumSdMetadata sd theLine = case theLine of
   (goEntry KeyVersion -> Just entry) -> sd{sdVersion = sdValue entry}
   (goEntry KeyTemplate -> Just entry) -> sd{sdPositiveTemplate = extractSdExtensions $ sdValue entry}
   (goEntry KeyNegativeTemplate -> Just entry) -> sd{sdNegativeTemplate = extractSdExtensions $ sdValue entry}
+  -- KeyPositivePrompt is not keyed by string, so we have to do this special case
   _ -> case sdPositivePrompt sd of
     ("", []) -> sd{sdPositivePrompt = extractSdExtensions theLine}
     _ -> error $ "parse error: " ++ theLine ++ " is not a valid SD metadata entry"
@@ -299,7 +302,9 @@ data CLIOpts = CLIOpts
   , optOutputCaption :: Maybe FilePath
   , optPrint :: Bool
   , optOverwriteInput :: Bool
+  , optBatch :: Bool
   , optForce :: Bool
+  , optCreateMissingDirs :: Bool
   , optEdit :: [(String, String)]
   }
   deriving (Show)
@@ -313,7 +318,9 @@ emptyCliOpts =
     , optOutputCaption = Nothing
     , optPrint = False
     , optOverwriteInput = False
+    , optBatch = False
     , optForce = False
+    , optCreateMissingDirs = False
     , optEdit = []
     }
 
@@ -321,14 +328,16 @@ emptyCliOpts =
 --  sd-png-metadata <options>
 --
 -- Options
---  --help               Show this help text.
---  --input-image        Input image file path. Required.
---  --output-image       Output image file path.
---  --output-caption     Output caption file path.
---  --print              Print the metadata to stdout.
---  --overwrite-input    Overwrite the input image with the metadata.
---  --force              Disable all overwrite checks.
---  --edit <key> <value> Edit the metadata.
+--  --help                Show this help text.
+--  --input-image         Input image file path. Required.
+--  --output-image        Output image file path.
+--  --output-caption      Output caption file path.
+--  --print               Print the metadata to stdout.
+--  --overwrite-input     Overwrite the input image with the metadata.
+--  --batch               Batch mode. Specified outputs must be directories.
+--  --force               Disable all overwrite checks.
+--  --create-missing-dirs Create any missing directories.
+--  --edit <key> <value>  Edit the metadata.
 --
 -- Supported keys: ****
 --
@@ -339,14 +348,16 @@ helpMessage =
     , " sd-png-metadata <options>"
     , ""
     , "Options"
-    , " --help               Show this help text."
-    , " --input-image        Input image file path. Required."
-    , " --output-image       Output image file path."
-    , " --output-caption     Output caption file path."
-    , " --print              Print the input image metadata to stdout."
-    , " --overwrite-input    Overwrite the input image with the metadata."
-    , " --force              Disable all overwrite checks."
-    , " --edit <key> <value> Edit the metadata."
+    , " --help                Show this help text."
+    , " --input-image         Input image file path. Required."
+    , " --output-image        Output image file path."
+    , " --output-caption      Output caption file path."
+    , " --print               Print the input image metadata to stdout."
+    , " --overwrite-input     Overwrite the input image with the metadata."
+    , " --batch               Batch mode. Specified files must be directories."
+    , " --force               Disable all overwrite checks."
+    , " --create-missing-dirs Create any missing directories."
+    , " --edit <key> <value>  Edit the metadata."
     , ""
     , "Supported keys:" ++ intercalate "\n  " ("" : map showKey [minBound ..])
     ]
@@ -363,7 +374,9 @@ parseCliOpts = go' <=< go emptyCliOpts
     "--output-caption" : path : rest -> go opts{optOutputCaption = Just path} rest
     "--print" : rest -> go opts{optPrint = True} rest
     "--overwrite-input" : rest -> go opts{optOverwriteInput = True} rest
+    "--batch" : rest -> go opts{optBatch = True} rest
     "--force" : rest -> go opts{optForce = True} rest
+    "--create-missing-dirs" : rest -> go opts{optCreateMissingDirs = True} rest
     "--edit" : key : value : rest -> go opts{optEdit = (key, value) : optEdit opts} rest
     arg : rest -> Left $ "Unexpected argument: " ++ show (arg : rest)
     [] -> Right opts
@@ -376,8 +389,8 @@ parseCliOpts = go' <=< go emptyCliOpts
           True -> case optOutputImage o of
             Nothing -> Right o{optOutputImage = Just $ optInputImage o}
             Just _ -> Left "Cannot overwrite input image when output image is specified"
-    let handleSpecialPrint o = case (optOutputImage o, optOutputCaption o) of
-          (Nothing, Nothing) -> Right o{optPrint = True}
+    let handleSpecialPrint o = case (optOutputImage o, optOutputCaption o, optBatch o) of
+          (Nothing, Nothing, False) -> Right o{optPrint = True}
           _ -> Right o
     let fixups =
           [ validateInput
@@ -387,6 +400,51 @@ parseCliOpts = go' <=< go emptyCliOpts
     if optHelp opts
       then pure opts
       else foldM (\o f -> f o) opts fixups
+
+looksLikeDir :: FilePath -> Bool
+looksLikeDir path = case reverse path of
+  '/' : _ -> True
+  '\\' : _ -> True
+  _ -> False
+
+validateBatch :: Either String CLIOpts -> IO (Either String CLIOpts)
+validateBatch eOpts = do
+  let validateInputImage o = case optInputImage o of
+        path ->
+          doesFileExist path >>= \case
+            True -> pure $ Left "Batch requires input image to be a directory"
+            False -> pure case looksLikeDir path of
+              True -> Right o
+              False -> Left "Batch requires input image directory to end with a slash"
+  let validateOutputImage o = case optOutputImage o of
+        Nothing -> pure $ Right o
+        Just path ->
+          doesFileExist path >>= \case
+            True -> pure $ Left "Batch requires output image to be a directory"
+            False -> pure case looksLikeDir path of
+              True -> Right o
+              False -> Left "Batch requires output image directory to end with a slash"
+  let validateOutputCaption o = case optOutputCaption o of
+        Nothing -> pure $ Right o
+        Just path ->
+          doesFileExist path >>= \case
+            True -> pure $ Left "Batch requires output caption to be a directory"
+            False -> pure case looksLikeDir path of
+              True -> Right o
+              False -> Left "Batch requires output caption directory to end with a slash"
+  let checks =
+        [ validateInputImage
+        , validateOutputImage
+        , validateOutputCaption
+        ]
+  let go eo f = case eo of
+        Left err -> pure $ Left err
+        Right o -> f o
+  case eOpts of
+    Left err -> pure $ Left err
+    Right opts -> case optBatch opts of
+      True -> foldM go eOpts checks
+      False -> pure eOpts
 
 forceEvalImage :: Image PixelRGBA8 -> IO ()
 forceEvalImage image = do
@@ -410,9 +468,107 @@ forceEvalMetadatas metadatas = do
   _ <- evaluate $ length $ show metadatas
   pure ()
 
+data DoSingle = DoSingle
+  { oneInputImage :: FilePath
+  , oneOutputImage :: Maybe FilePath
+  , oneOutputCaption :: Maybe FilePath
+  }
+
+doSingle :: CLIOpts -> DoSingle -> IO ()
+doSingle opts single = do
+  let inputFile = oneInputImage single
+  let mOutputImage = oneOutputImage single
+  let mOutputCaption = oneOutputCaption single
+  let existsCheck path = case optForce opts of
+        True -> pure ()
+        False -> do
+          exists <- doesFileExist path
+          when exists do
+            putStrLn $ "Output file already exists: " ++ path
+            exitFailure
+  readImageWithMetadata inputFile >>= \case
+    Left err -> putStrLn $ "Error loading image: " ++ err
+    Right (dynImage, metadatas) -> do
+      let image = convertRGBA8 dynImage
+      let parameters = J.lookup (J.Unknown "parameters") metadatas
+      case parameters of
+        Nothing -> putStrLn "No parameters metadata found"
+        Just (J.String text) -> do
+          let sd = parseSdMetadata text
+          when (optPrint opts) do
+            putStrLn $ prettySdMetadata sd
+          let sd' = foldr editSdMetadata sd (optEdit opts)
+          let metadatas' = applyToMetadatas sd' metadatas
+          forceEvalMetadatas metadatas' -- forces out error messages before we start writing files
+          case mOutputImage of
+            Nothing -> pure ()
+            Just path -> do
+              if optOverwriteInput opts
+                then do
+                  assert (path == inputFile) $ pure ()
+                  -- XXX: a less silly way of doing this would be to load as a ByteString, evaluate that instead, and then decode the image and metadata
+                  forceEvalImage image
+                else do
+                  existsCheck path
+              let bs = encodePngWithMetadata metadatas' image
+              BS.writeFile path bs
+          case mOutputCaption of
+            Nothing -> pure ()
+            Just path -> do
+              existsCheck path
+              let caption = inlineSdExtensions $ sdPositivePrompt sd'
+              writeFile path caption
+        Just val -> putStrLn $ "Unexpected \"parameters\" metadata value: " ++ show val
+
+isPng :: FilePath -> Bool
+isPng path = ext == ".png" || ext == ".PNG"
+ where
+  ext = takeExtension path
+
+doBatch :: CLIOpts -> IO ()
+doBatch opts = do
+  when (optCreateMissingDirs opts) do
+    case optOutputImage opts of
+      Nothing -> pure ()
+      Just path -> createDirectoryIfMissing True path
+    case optOutputCaption opts of
+      Nothing -> pure ()
+      Just path -> createDirectoryIfMissing True path
+  inputFiles <- listDirectory $ optInputImage opts
+  let inputFiles' = filter isPng inputFiles
+  let count = length inputFiles'
+  let doOne inputFile index = do
+        let inputBase = takeBaseName inputFile
+        let inputPath = optInputImage opts </> inputFile
+        let outputPath = (</> inputFile) <$> optOutputImage opts
+        let outputCaptionPath = (</> (inputBase ++ ".txt")) <$> optOutputCaption opts
+        putStrLn $ "Processing " ++ inputPath ++ " (" ++ show index ++ "/" ++ show count ++ ")"
+        doSingle opts $ DoSingle inputPath outputPath outputCaptionPath
+  mapM_ (uncurry doOne) $ zip inputFiles' [1 :: Int ..]
+
+doNonBatch :: CLIOpts -> IO ()
+doNonBatch opts = do
+  let inputFile = optInputImage opts
+  let outputFile = optOutputImage opts
+  let outputCaption = optOutputCaption opts
+  when (optCreateMissingDirs opts) do
+    case outputFile of
+      Nothing -> pure ()
+      Just path -> createDirectoryIfMissing True $ takeDirectory path
+    case outputCaption of
+      Nothing -> pure ()
+      Just path -> createDirectoryIfMissing True $ takeDirectory path
+  doSingle
+    opts
+    DoSingle
+      { oneInputImage = inputFile
+      , oneOutputImage = outputFile
+      , oneOutputCaption = outputCaption
+      }
+
 main :: IO ()
 main = do
-  fmap parseCliOpts getArgs >>= \case
+  fmap parseCliOpts getArgs >>= validateBatch >>= \case
     Left err -> do
       putStrLn err
       putStrLn ""
@@ -422,44 +578,6 @@ main = do
       when (optHelp opts) do
         putStrLn helpMessage
         exitSuccess
-      let inputFile = optInputImage opts
-      let existsCheck path = case optForce opts of
-            True -> pure ()
-            False -> do
-              exists <- doesFileExist path
-              when exists do
-                putStrLn $ "Output file already exists: " ++ path
-                exitFailure
-      readImageWithMetadata inputFile >>= \case
-        Left err -> putStrLn $ "Error loading image: " ++ err
-        Right (dynImage, metadatas) -> do
-          let image = convertRGBA8 dynImage
-          let parameters = J.lookup (J.Unknown "parameters") metadatas
-          case parameters of
-            Nothing -> putStrLn "No parameters metadata found"
-            Just (J.String text) -> do
-              let sd = parseSdMetadata text
-              when (optPrint opts) do
-                putStrLn $ prettySdMetadata sd
-              let sd' = foldr editSdMetadata sd (optEdit opts)
-              let metadatas' = applyToMetadatas sd' metadatas
-              forceEvalMetadatas metadatas' -- forces out error messages before we start writing files
-              case optOutputImage opts of
-                Nothing -> pure ()
-                Just path -> do
-                  if optOverwriteInput opts
-                    then do
-                      assert (path == inputFile) $ pure ()
-                      -- XXX: a less silly way of doing this would be to load as a ByteString, evaluate that instead, and then decode the image and metadata
-                      forceEvalImage image
-                    else do
-                      existsCheck path
-                  let bs = encodePngWithMetadata metadatas' image
-                  BS.writeFile path bs
-              case optOutputCaption opts of
-                Nothing -> pure ()
-                Just path -> do
-                  existsCheck path
-                  let caption = inlineSdExtensions $ sdPositivePrompt sd'
-                  writeFile path caption
-            Just val -> putStrLn $ "Unexpected \"parameters\" metadata value: " ++ show val
+      if optBatch opts
+        then doBatch opts
+        else doNonBatch opts
