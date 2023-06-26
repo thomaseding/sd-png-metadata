@@ -4,6 +4,7 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
+{-# HLINT ignore "Replace case with fromMaybe" #-}
 {-# HLINT ignore "Redundant fmap" #-}
 {-# HLINT ignore "Redundant pure" #-}
 {-# HLINT ignore "Use forM_" #-}
@@ -22,11 +23,11 @@ import Codec.Picture (
 import qualified Codec.Picture.Metadata as J
 import Control.Applicative (Alternative (empty))
 import Control.Exception (assert, evaluate)
-import Control.Monad (foldM, when, (<=<))
+import Control.Monad (foldM, msum, when, (<=<))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (runMaybeT))
 import qualified Data.ByteString.Lazy.Char8 as BS
-import Data.List (foldl', intercalate, sort, stripPrefix)
+import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf, sort, stripPrefix)
 import Data.List.Split (splitOn)
 import Data.Maybe (catMaybes)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
@@ -362,6 +363,7 @@ data CLIOpts = CLIOpts
   , optOutputCaption :: Maybe FilePath
   , optPrint :: Bool
   , optLogFile :: Maybe FilePath
+  , optPatternFile :: Maybe FilePath
   , optOverwriteInput :: Bool
   , optBatch :: Bool
   , optForce :: Bool
@@ -379,6 +381,7 @@ emptyCliOpts =
     , optOutputCaption = Nothing
     , optPrint = False
     , optLogFile = Nothing
+    , optPatternFile = Nothing
     , optOverwriteInput = False
     , optBatch = False
     , optForce = False
@@ -390,17 +393,24 @@ emptyCliOpts =
 --  sd-png-metadata <options>
 --
 -- Options
---  --help                Show this help text.
---  --input-image         Input image file path. Required.
---  --output-image        Output image file path.
---  --output-caption      Output caption file path.
---  --print               Print the metadata to stdout.
---  --log-file            Log file path.
---  --overwrite-input     Overwrite the input image with the metadata.
---  --batch               Batch mode. Specified outputs must be directories.
---  --force               Disable all overwrite checks.
---  --create-missing-dirs Create any missing directories.
---  --edit <key> <value>  Edit the metadata.
+--   --help                Show this help text.
+--   --input-image         Input image file path. Required.
+--   --output-image        Output image file path.
+--   --output-caption      Output caption file path.
+--   --print               Print the metadata to stdout.
+--   --log-file            Log file path.
+--   --pattern-file        Pattern file path for caption output.
+--   --overwrite-input     Overwrite the input image with the metadata.
+--   --batch               Batch mode. Specified outputs must be directories.
+--   --force               Disable all overwrite checks.
+--   --create-missing-dirs Create any missing directories.
+--   --edit <key> <value>  Edit the metadata.
+--
+-- Pattern file format:
+--   some text before subject * and some after
+--   * some text after the subject
+--   some text before the subject *
+--   as many pattern lines * in the pattern file as you want
 --
 -- Supported keys: ****
 --
@@ -411,17 +421,24 @@ helpMessage =
     , " sd-png-metadata <options>"
     , ""
     , "Options"
-    , " --help                Show this help text."
-    , " --input-image         Input image file path. Required."
-    , " --output-image        Output image file path."
-    , " --output-caption      Output caption file path."
-    , " --log-file            Log file path."
-    , " --print               Print the input image metadata to stdout."
-    , " --overwrite-input     Overwrite the input image with the metadata."
-    , " --batch               Batch mode. Specified files must be directories."
-    , " --force               Disable all overwrite checks."
-    , " --create-missing-dirs Create any missing directories."
-    , " --edit <key> <value>  Edit the metadata."
+    , "  --help                Show this help text."
+    , "  --input-image         Input image file path. Required."
+    , "  --output-image        Output image file path."
+    , "  --output-caption      Output caption file path."
+    , "  --log-file            Log file path."
+    , "  --pattern-file        Pattern file path for caption output."
+    , "  --print               Print the input image metadata to stdout."
+    , "  --overwrite-input     Overwrite the input image with the metadata."
+    , "  --batch               Batch mode. Specified files must be directories."
+    , "  --force               Disable all overwrite checks."
+    , "  --create-missing-dirs Create any missing directories."
+    , "  --edit <key> <value>  Edit the metadata."
+    , ""
+    , "Pattern file format:"
+    , "  some text before subject * and some after"
+    , "  * some text after the subject"
+    , "  some text before the subject *"
+    , "  as many pattern lines * in the pattern file as you want"
     , ""
     , "Supported keys:" ++ intercalate "\n  " ("" : map showKey [minBound ..])
     ]
@@ -437,6 +454,7 @@ parseCliOpts = go' <=< go emptyCliOpts
     "--output-image" : path : rest -> go opts{optOutputImage = Just path} rest
     "--output-caption" : path : rest -> go opts{optOutputCaption = Just path} rest
     "--log-file" : path : rest -> go opts{optLogFile = Just path} rest
+    "--pattern-file" : path : rest -> go opts{optPatternFile = Just path} rest
     "--print" : rest -> go opts{optPrint = True} rest
     "--overwrite-input" : rest -> go opts{optOverwriteInput = True} rest
     "--batch" : rest -> go opts{optBatch = True} rest
@@ -533,11 +551,38 @@ forceEvalMetadatas metadatas = do
   _ <- evaluate $ length $ show metadatas
   pure ()
 
+patternWildcard :: Char
+patternWildcard = '*'
+
+mkPrefixPatterns :: [String] -> [String]
+mkPrefixPatterns = map (takeWhile (/= patternWildcard))
+
+mkSuffixPatterns :: [String] -> [String]
+mkSuffixPatterns = map (tail . dropWhile (/= patternWildcard))
+
+makePatternPairs :: [String] -> [(String, String)]
+makePatternPairs patterns = zip (mkPrefixPatterns patterns) (mkSuffixPatterns patterns)
+
+readPatternPairs :: FilePath -> IO [(String, String)]
+readPatternPairs path = do
+  contents <- readFile path
+  let patterns = filter (not . null) $ map trim $ lines contents
+  pure $ makePatternPairs patterns
+
+extractSubject :: [(String, String)] -> String -> Maybe String
+extractSubject [] str = Just str
+extractSubject patternPairs str = msum do
+  (prefix, suffix) <- patternPairs
+  let isMatch = isPrefixOf prefix str && isSuffixOf suffix str
+      subject = trim $ takeWhile (/= ',') $ drop (length prefix) (take (length str - length suffix) str)
+  pure if isMatch then Just subject else Nothing
+
 data DoSingle = DoSingle
   { oneInputImage :: FilePath
   , oneOutputImage :: Maybe FilePath
   , oneOutputCaption :: Maybe FilePath
   , oneLogger :: String -> IO ()
+  , onePatternPairs :: [(String, String)]
   }
 
 doSingle :: CLIOpts -> DoSingle -> MaybeT IO ()
@@ -589,7 +634,13 @@ doSingle opts single = do
             Just path -> do
               existsCheck path
               let caption = inlineSdExtensions $ sdPositivePrompt sd'
-              liftIO $ writeFile path caption
+              caption' <- case extractSubject (onePatternPairs single) caption of
+                Just subject -> pure subject
+                Nothing -> do
+                  liftIO $ oneLogger single $ "Unable to extract subject from : " ++ caption
+                  -- pure caption
+                  empty
+              liftIO $ writeFile path caption'
         Just val -> do
           liftIO $ oneLogger single $ "Unexpected \"parameters\" metadata value: " ++ show val
           empty
@@ -601,8 +652,8 @@ isPng path = ext == ".png" || ext == ".PNG"
 
 type Logger = String -> IO ()
 
-doBatch :: CLIOpts -> Logger -> IO ()
-doBatch opts logger = do
+doBatch :: CLIOpts -> Logger -> [(String, String)] -> IO ()
+doBatch opts logger patternPairs = do
   when (optCreateMissingDirs opts) do
     case optOutputImage opts of
       Nothing -> pure ()
@@ -627,14 +678,15 @@ doBatch opts logger = do
                 , oneOutputImage = outputPath
                 , oneOutputCaption = outputCaptionPath
                 , oneLogger = logger
+                , onePatternPairs = patternPairs
                 }
         case result of
           Nothing -> pure () -- maybe add a CLI to abort on error?
           Just () -> pure ()
   mapM_ (uncurry doOne) $ zip inputFiles' [1 :: Int ..]
 
-doNonBatch :: CLIOpts -> Logger -> IO ()
-doNonBatch opts logger = do
+doNonBatch :: CLIOpts -> Logger -> [(String, String)] -> IO ()
+doNonBatch opts logger patternPairs = do
   let inputFile = optInputImage opts
   let outputFile = optOutputImage opts
   let outputCaption = optOutputCaption opts
@@ -654,6 +706,7 @@ doNonBatch opts logger = do
           , oneOutputImage = outputFile
           , oneOutputCaption = outputCaption
           , oneLogger = logger
+          , onePatternPairs = patternPairs
           }
   case result of
     Nothing -> exitFailure
@@ -681,6 +734,9 @@ main = do
           pure \msg -> do
             hPutStrLn handle msg
             putStrLn msg
+      patternPairs <- case optPatternFile opts of
+        Nothing -> pure []
+        Just path -> readPatternPairs path
       if optBatch opts
-        then doBatch opts logger
-        else doNonBatch opts logger
+        then doBatch opts logger patternPairs
+        else doNonBatch opts logger patternPairs
