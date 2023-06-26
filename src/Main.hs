@@ -1,5 +1,6 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE StrictData #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
@@ -19,8 +20,11 @@ import Codec.Picture (
   readImageWithMetadata,
  )
 import qualified Codec.Picture.Metadata as J
+import Control.Applicative (Alternative (empty))
 import Control.Exception (assert, evaluate)
 import Control.Monad (foldM, when, (<=<))
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Maybe (MaybeT (runMaybeT))
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.List (foldl', intercalate, sort, stripPrefix)
 import Data.List.Split (splitOn)
@@ -30,6 +34,13 @@ import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath (takeBaseName, takeDirectory, takeExtension, (</>))
+import System.IO (
+  BufferMode (LineBuffering),
+  IOMode (AppendMode),
+  hPutStrLn,
+  hSetBuffering,
+  openFile,
+ )
 
 -- SD metadata format:
 --
@@ -49,6 +60,8 @@ data Key
   | KeySize
   | KeyModelHash
   | KeyModel
+  | KeyClipSkip
+  | KeyCFGRescalePhi
   | KeyLoraHashes
   | KeyVersion
   | KeyTemplate
@@ -67,6 +80,8 @@ keyToText key = case key of
   KeySize -> "Size"
   KeyModelHash -> "Model hash"
   KeyModel -> "Model"
+  KeyClipSkip -> "Clip skip"
+  KeyCFGRescalePhi -> "CFG Rescale phi"
   KeyLoraHashes -> "Lora hashes"
   KeyVersion -> "Version"
   KeyTemplate -> "Template"
@@ -83,6 +98,8 @@ data SDMetadata = SDMetadata
   , sdSize :: (Int, Int)
   , sdModelHash :: String
   , sdModel :: String
+  , sdClipSkip :: Maybe Int
+  , sdCfgRescalePhi :: Maybe Int
   , sdLoraHashes :: [(String, String)]
   , sdVersion :: String
   , sdPositiveTemplate :: (String, [SDExtension])
@@ -103,6 +120,8 @@ emptySdMetadata =
     , sdSize = (0, 0)
     , sdModelHash = ""
     , sdModel = ""
+    , sdClipSkip = Nothing
+    , sdCfgRescalePhi = Nothing
     , sdLoraHashes = []
     , sdVersion = ""
     , sdPositiveTemplate = ("", [])
@@ -192,6 +211,8 @@ accumSdMetadata sd theLine = case theLine of
   (goEntry KeySize -> Just entry) -> sd{sdSize = readSize $ sdValue entry}
   (goEntry KeyModelHash -> Just entry) -> sd{sdModelHash = sdValue entry}
   (goEntry KeyModel -> Just entry) -> sd{sdModel = sdValue entry}
+  (goEntry KeyClipSkip -> Just entry) -> sd{sdClipSkip = Just $ read $ sdValue entry}
+  (goEntry KeyCFGRescalePhi -> Just entry) -> sd{sdCfgRescalePhi = Just $ read $ sdValue entry}
   (goEntry KeyLoraHashes -> Just entry) -> sd{sdLoraHashes = readLoraHashes $ sdValue entry}
   (goEntry KeyVersion -> Just entry) -> sd{sdVersion = sdValue entry}
   (goEntry KeyTemplate -> Just entry) -> sd{sdPositiveTemplate = extractSdExtensions $ sdValue entry}
@@ -258,6 +279,12 @@ toParameters sd = (J.Unknown "parameters", value)
       , showKey KeySize $ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
       , showKey KeyModelHash $ sdModelHash sd
       , showKey KeyModel $ sdModel sd
+      , case sdClipSkip sd of
+          Nothing -> Nothing
+          Just clipSkip -> showKey KeyClipSkip $ show clipSkip
+      , case sdCfgRescalePhi sd of
+          Nothing -> Nothing
+          Just phi -> showKey KeyCFGRescalePhi $ show phi
       , showKey KeyLoraHashes $ intercalate "," (map (\(k, v) -> k ++ ": " ++ v) $ sdLoraHashes sd)
       , showKey KeyVersion $ sdVersion sd
       ]
@@ -278,6 +305,12 @@ prettySdMetadata sd =
       , showKey KeySize $ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
       , showKey KeyModelHash $ sdModelHash sd
       , showKey KeyModel $ sdModel sd
+      , case sdClipSkip sd of
+          Nothing -> Nothing
+          Just clipSkip -> showKey KeyClipSkip $ show clipSkip
+      , case sdCfgRescalePhi sd of
+          Nothing -> Nothing
+          Just phi -> showKey KeyCFGRescalePhi $ show phi
       , showKey KeyLoraHashes $ intercalate "," (map (\(k, v) -> k ++ ": " ++ v) $ sdLoraHashes sd)
       , showKey KeyVersion $ sdVersion sd
       , if null $ sdPositiveTemplate sd
@@ -312,6 +345,8 @@ editSdMetadata (key, val) = case key of
   (eq KeySize -> True) -> \sd -> sd{sdSize = readSize val}
   (eq KeyModelHash -> True) -> \sd -> sd{sdModelHash = val}
   (eq KeyModel -> True) -> \sd -> sd{sdModel = val}
+  (eq KeyClipSkip -> True) -> \sd -> sd{sdClipSkip = Just $ read val}
+  (eq KeyCFGRescalePhi -> True) -> \sd -> sd{sdCfgRescalePhi = Just $ read val}
   (eq KeyLoraHashes -> True) -> \sd -> sd{sdLoraHashes = readLoraHashes val}
   (eq KeyVersion -> True) -> \sd -> sd{sdVersion = val}
   (eq KeyTemplate -> True) -> \sd -> sd{sdPositiveTemplate = extractSdExtensions val}
@@ -326,6 +361,7 @@ data CLIOpts = CLIOpts
   , optOutputImage :: Maybe FilePath
   , optOutputCaption :: Maybe FilePath
   , optPrint :: Bool
+  , optLogFile :: Maybe FilePath
   , optOverwriteInput :: Bool
   , optBatch :: Bool
   , optForce :: Bool
@@ -342,6 +378,7 @@ emptyCliOpts =
     , optOutputImage = Nothing
     , optOutputCaption = Nothing
     , optPrint = False
+    , optLogFile = Nothing
     , optOverwriteInput = False
     , optBatch = False
     , optForce = False
@@ -358,6 +395,7 @@ emptyCliOpts =
 --  --output-image        Output image file path.
 --  --output-caption      Output caption file path.
 --  --print               Print the metadata to stdout.
+--  --log-file            Log file path.
 --  --overwrite-input     Overwrite the input image with the metadata.
 --  --batch               Batch mode. Specified outputs must be directories.
 --  --force               Disable all overwrite checks.
@@ -377,6 +415,7 @@ helpMessage =
     , " --input-image         Input image file path. Required."
     , " --output-image        Output image file path."
     , " --output-caption      Output caption file path."
+    , " --log-file            Log file path."
     , " --print               Print the input image metadata to stdout."
     , " --overwrite-input     Overwrite the input image with the metadata."
     , " --batch               Batch mode. Specified files must be directories."
@@ -397,6 +436,7 @@ parseCliOpts = go' <=< go emptyCliOpts
     "--input-image" : path : rest -> go opts{optInputImage = path} rest
     "--output-image" : path : rest -> go opts{optOutputImage = Just path} rest
     "--output-caption" : path : rest -> go opts{optOutputCaption = Just path} rest
+    "--log-file" : path : rest -> go opts{optLogFile = Just path} rest
     "--print" : rest -> go opts{optPrint = True} rest
     "--overwrite-input" : rest -> go opts{optOverwriteInput = True} rest
     "--batch" : rest -> go opts{optBatch = True} rest
@@ -497,9 +537,10 @@ data DoSingle = DoSingle
   { oneInputImage :: FilePath
   , oneOutputImage :: Maybe FilePath
   , oneOutputCaption :: Maybe FilePath
+  , oneLogger :: String -> IO ()
   }
 
-doSingle :: CLIOpts -> DoSingle -> IO ()
+doSingle :: CLIOpts -> DoSingle -> MaybeT IO ()
 doSingle opts single = do
   let inputFile = oneInputImage single
   let mOutputImage = oneOutputImage single
@@ -507,25 +548,30 @@ doSingle opts single = do
   let existsCheck path = case optForce opts of
         True -> pure ()
         False -> do
-          exists <- doesFileExist path
+          exists <- liftIO $ doesFileExist path
           when exists do
-            putStrLn $ "Output file already exists: " ++ path
-            exitFailure
-  readImageWithMetadata inputFile >>= \case
-    Left err -> putStrLn $ "Error loading image: " ++ err
+            liftIO $ oneLogger single $ "Output file already exists: " ++ path
+            empty
+  liftIO (readImageWithMetadata inputFile) >>= \case
+    Left err -> do
+      liftIO $ oneLogger single $ "Error loading image: " ++ err
+      empty
     Right (dynImage, metadatas) -> do
       let image = convertRGBA8 dynImage
       let parameters = J.lookup (J.Unknown "parameters") metadatas
       case parameters of
-        Nothing -> putStrLn "No parameters metadata found"
+        Nothing -> do
+          liftIO $ oneLogger single "No \"parameters\" metadata found"
+          liftIO $ oneLogger single $ show metadatas
+          empty
         Just (J.String text) -> do
           let text' = massageLines text
           let sd = parseSdMetadata text'
           when (optPrint opts) do
-            putStrLn $ prettySdMetadata sd
+            liftIO $ putStrLn $ prettySdMetadata sd
           let sd' = foldr editSdMetadata sd (optEdit opts)
           let metadatas' = applyToMetadatas sd' metadatas
-          forceEvalMetadatas metadatas' -- forces out error messages before we start writing files
+          liftIO $ forceEvalMetadatas metadatas' -- forces out error messages before we start writing files
           case mOutputImage of
             Nothing -> pure ()
             Just path -> do
@@ -533,33 +579,37 @@ doSingle opts single = do
                 then do
                   assert (path == inputFile) $ pure ()
                   -- XXX: a less silly way of doing this would be to load as a ByteString, evaluate that instead, and then decode the image and metadata
-                  forceEvalImage image
+                  liftIO $ forceEvalImage image
                 else do
                   existsCheck path
               let bs = encodePngWithMetadata metadatas' image
-              BS.writeFile path bs
+              liftIO $ BS.writeFile path bs
           case mOutputCaption of
             Nothing -> pure ()
             Just path -> do
               existsCheck path
               let caption = inlineSdExtensions $ sdPositivePrompt sd'
-              writeFile path caption
-        Just val -> putStrLn $ "Unexpected \"parameters\" metadata value: " ++ show val
+              liftIO $ writeFile path caption
+        Just val -> do
+          liftIO $ oneLogger single $ "Unexpected \"parameters\" metadata value: " ++ show val
+          empty
 
 isPng :: FilePath -> Bool
 isPng path = ext == ".png" || ext == ".PNG"
  where
   ext = takeExtension path
 
-doBatch :: CLIOpts -> IO ()
-doBatch opts = do
+type Logger = String -> IO ()
+
+doBatch :: CLIOpts -> Logger -> IO ()
+doBatch opts logger = do
   when (optCreateMissingDirs opts) do
     case optOutputImage opts of
       Nothing -> pure ()
-      Just path -> createDirectoryIfMissing True path
+      Just path -> createDirectoryIfMissing True $ takeDirectory path
     case optOutputCaption opts of
       Nothing -> pure ()
-      Just path -> createDirectoryIfMissing True path
+      Just path -> createDirectoryIfMissing True $ takeDirectory path
   inputFiles <- listDirectory $ optInputImage opts
   let inputFiles' = sort $ filter isPng inputFiles
   let count = length inputFiles'
@@ -568,12 +618,23 @@ doBatch opts = do
         let inputPath = optInputImage opts </> inputFile
         let outputPath = (</> inputFile) <$> optOutputImage opts
         let outputCaptionPath = (</> (inputBase ++ ".txt")) <$> optOutputCaption opts
-        putStrLn $ "Processing " ++ inputPath ++ " (" ++ show index ++ "/" ++ show count ++ ")"
-        doSingle opts $ DoSingle inputPath outputPath outputCaptionPath
+        logger $ "Processing " ++ inputPath ++ " (" ++ show index ++ "/" ++ show count ++ ")"
+        result <-
+          runMaybeT $
+            doSingle opts $
+              DoSingle
+                { oneInputImage = inputPath
+                , oneOutputImage = outputPath
+                , oneOutputCaption = outputCaptionPath
+                , oneLogger = logger
+                }
+        case result of
+          Nothing -> pure () -- maybe add a CLI to abort on error?
+          Just () -> pure ()
   mapM_ (uncurry doOne) $ zip inputFiles' [1 :: Int ..]
 
-doNonBatch :: CLIOpts -> IO ()
-doNonBatch opts = do
+doNonBatch :: CLIOpts -> Logger -> IO ()
+doNonBatch opts logger = do
   let inputFile = optInputImage opts
   let outputFile = optOutputImage opts
   let outputCaption = optOutputCaption opts
@@ -584,13 +645,19 @@ doNonBatch opts = do
     case outputCaption of
       Nothing -> pure ()
       Just path -> createDirectoryIfMissing True $ takeDirectory path
-  doSingle
-    opts
-    DoSingle
-      { oneInputImage = inputFile
-      , oneOutputImage = outputFile
-      , oneOutputCaption = outputCaption
-      }
+  result <-
+    runMaybeT $
+      doSingle
+        opts
+        DoSingle
+          { oneInputImage = inputFile
+          , oneOutputImage = outputFile
+          , oneOutputCaption = outputCaption
+          , oneLogger = logger
+          }
+  case result of
+    Nothing -> exitFailure
+    Just () -> pure ()
 
 main :: IO ()
 main = do
@@ -605,6 +672,15 @@ main = do
       when (optHelp opts) do
         putStrLn helpMessage
         exitSuccess
+      logger <- case optLogFile opts of
+        Nothing -> pure putStrLn
+        Just path -> do
+          -- just let the runtime close the handle for us on exit
+          handle <- openFile path AppendMode
+          hSetBuffering handle LineBuffering
+          pure \msg -> do
+            hPutStrLn handle msg
+            putStrLn msg
       if optBatch opts
-        then doBatch opts
-        else doNonBatch opts
+        then doBatch opts logger
+        else doNonBatch opts logger

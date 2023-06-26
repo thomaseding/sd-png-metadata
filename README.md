@@ -12,6 +12,7 @@ Options
  --input-image         Input image file path. Required.
  --output-image        Output image file path.
  --output-caption      Output caption file path.
+ --log-file            Log file path.
  --print               Print the input image metadata to stdout.
  --overwrite-input     Overwrite the input image with the metadata.
  --batch               Batch mode. Specified files must be directories.
@@ -30,6 +31,8 @@ Supported keys:
   "Size"
   "Model hash"
   "Model"
+  "Clip skip"
+  "CFG Rescale phi"
   "Lora hashes"
   "Version"
   "Template"
