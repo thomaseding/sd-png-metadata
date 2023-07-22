@@ -21,6 +21,7 @@ Options
   --force               Disable all overwrite checks.
   --create-missing-dirs Create any missing directories.
   --edit <key> <value>  Edit the metadata.
+  --no-prompt-weights   Removes weights from metadata prompts.
 
 Pattern file format:
   some text before subject * and some after

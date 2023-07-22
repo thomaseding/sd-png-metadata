@@ -27,7 +27,7 @@ import Control.Monad (foldM, msum, when, (<=<))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (runMaybeT))
 import qualified Data.ByteString.Lazy.Char8 as BS
-import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf, sort, stripPrefix)
+import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf, partition, sort, stripPrefix)
 import Data.List.Split (splitOn)
 import Data.Maybe (catMaybes)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
@@ -197,6 +197,47 @@ extractSdExtensions = go ("", [])
     (stripSdExtension -> Just (rest, ext)) -> go (accText, ext : accExts) rest
     (c : rest) -> go (c : accText, accExts) rest
     [] -> (trimHeavy $ reverse accText, reverse accExts)
+
+-- SD weighted text is of the form `(ipsum lorem foo bar:DECIMAL_WEIGHT)`
+data SDWeightedText = SDWeightedText
+  { sdText :: String
+  , sdWeight :: String
+  }
+  deriving (Show)
+
+-- Doesn't handle nested weighted text
+stripSdWeightedText :: String -> Maybe (String, SDWeightedText)
+stripSdWeightedText = \case
+  '(' : rest ->
+    let (text, rest') = span (`notElem` ":)") rest
+     in go text "1.1" rest'
+  _ -> Nothing
+ where
+  go :: String -> String -> String -> Maybe (String, SDWeightedText)
+  go text weight = \case
+    ':' : weightBegin ->
+      let (weight', rest) = span (/= ')') weightBegin
+          weight'' = trim weight'
+       in case isDecimalNumber weight'' of
+            True -> go text weight'' rest
+            False -> Nothing
+    ')' : rest -> Just (rest, SDWeightedText text weight)
+    _ -> Nothing
+
+-- Removes the weighted text encoding from the input string
+removeTextWeights :: String -> String
+removeTextWeights = go ""
+ where
+  go acc = \case
+    (stripSdWeightedText -> Just (rest, weighted)) -> go (reverse (sdText weighted) ++ acc) rest
+    (c : rest) -> go (c : acc) rest
+    [] -> reverse acc
+
+isDecimalNumber :: String -> Bool
+isDecimalNumber ('-' : rest) = isDecimalNumber rest
+isDecimalNumber s = case partition (== '.') s of
+  ('.' : '.' : _, _) -> False
+  (_, s') -> all (`elem` ['0' .. '9']) s'
 
 trim :: String -> String
 trim = f . f
@@ -405,6 +446,19 @@ editSdMetadata (key, val) sd = case key of
   KeyNegativeTemplate -> sd{sdNegativeTemplate = extractSdExtensions val}
   KeyControlNet0 -> sd{sdControlNet0 = Just val}
 
+removeMetadataPromptWeights :: SDMetadata -> SDMetadata
+removeMetadataPromptWeights sd = sd'
+ where
+  (posPromptText, posPromptExts) = sdPositivePrompt sd
+  (negPromptText, negPromptExts) = sdNegativePrompt sd
+  posPromptText' = trim $ removeTextWeights posPromptText
+  negPromptText' = trim $ removeTextWeights negPromptText
+  sd' =
+    sd
+      { sdPositivePrompt = (posPromptText', posPromptExts)
+      , sdNegativePrompt = (negPromptText', negPromptExts)
+      }
+
 data CLIOpts = CLIOpts
   { optHelp :: Bool
   , optInputImage :: FilePath
@@ -419,6 +473,7 @@ data CLIOpts = CLIOpts
   , optForce :: Bool
   , optCreateMissingDirs :: Bool
   , optEdit :: [(Key, String)]
+  , optRemovePromptWeights :: Bool
   }
   deriving (Show)
 
@@ -438,6 +493,7 @@ emptyCliOpts =
     , optForce = False
     , optCreateMissingDirs = False
     , optEdit = []
+    , optRemovePromptWeights = False
     }
 
 -- Usage:
@@ -457,6 +513,7 @@ emptyCliOpts =
 --   --force               Disable all overwrite checks.
 --   --create-missing-dirs Create any missing directories.
 --   --edit <key> <value>  Edit the metadata.
+--   --no-prompt-weights   Removes weights from metadata prompts.
 --
 -- Pattern file format:
 --   some text before subject * and some after
@@ -486,6 +543,7 @@ helpMessage =
     , "  --force               Disable all overwrite checks."
     , "  --create-missing-dirs Create any missing directories."
     , "  --edit <key> <value>  Edit the metadata."
+    , "  --no-prompt-weights   Removes weights from metadata prompts."
     , ""
     , "Pattern file format:"
     , "  some text before subject * and some after"
@@ -519,6 +577,7 @@ parseCliOpts = go' <=< go emptyCliOpts
     "--edit" : key : value : rest -> case toKey key of
       Right key' -> go opts{optEdit = (key', value) : optEdit opts} rest
       Left err -> Left err
+    "--no-prompt-weights" : rest -> go opts{optRemovePromptWeights = True} rest
     arg : rest -> Left $ "Unexpected argument: " ++ show (arg : rest)
     [] -> Right opts
   go' opts = do
@@ -675,13 +734,16 @@ doSingle opts single = do
         Just (J.String text) -> do
           let text' = massageLines text
           let sd = parseSdMetadata text'
+          let goWeights = case optRemovePromptWeights opts of
+                True -> removeMetadataPromptWeights
+                False -> id
+          let sd' = goWeights $ foldr editSdMetadata sd (optEdit opts)
+          let metadatas' = applyToMetadatas sd' metadatas
           when (optPrint opts) do
-            liftIO $ putStrLn $ prettySdMetadata True [] sd
+            liftIO $ putStrLn $ prettySdMetadata True [] sd'
           case optPrintKey opts of
             [] -> pure ()
-            keys -> liftIO $ putStrLn $ prettySdMetadata False keys sd
-          let sd' = foldr editSdMetadata sd (optEdit opts)
-          let metadatas' = applyToMetadatas sd' metadatas
+            keys -> liftIO $ putStrLn $ prettySdMetadata False keys sd'
           liftIO $ forceEvalMetadatas metadatas' -- forces out error messages before we start writing files
           case mOutputImage of
             Nothing -> pure ()
