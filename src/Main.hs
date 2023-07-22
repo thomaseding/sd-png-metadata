@@ -44,6 +44,39 @@ import System.IO (
   openFile,
  )
 
+myRead :: HasCallStack => Read a => String -> a
+myRead s = case reads s of
+  [(x, "")] -> x
+  _ -> error $ "myRead: cannot read " ++ show s
+
+trim :: String -> String
+trim = f . f
+ where
+  f = reverse . dropWhile (== ' ')
+
+-- trims front and tail and squishes multiple spaces into one
+-- replaces all non-space whitespace with spaces
+trimHeavy :: String -> String
+trimHeavy = unwords . words
+
+isDecimalNumber :: String -> Bool
+isDecimalNumber ('-' : rest) = isDecimalNumber rest
+isDecimalNumber s = case partition (== '.') s of
+  ('.' : '.' : _, _) -> False
+  (_, s') -> all (`elem` ['0' .. '9']) s'
+
+isDotDec :: Char -> Bool
+isDotDec c = c `elem` ('.' : ['0' .. '9'])
+
+newtype FloatString = FloatString {unFloatString :: String}
+  deriving (Eq, Ord, Show)
+
+instance Read FloatString where
+  readsPrec _ s = case partition isDotDec s of
+    (s', _) -> case isDecimalNumber s' of
+      True -> [(FloatString s', "")]
+      False -> []
+
 -- SD metadata format:
 --
 -- Aside from the positive prompt, all of the fields are keyed by an explicit string.
@@ -119,14 +152,14 @@ data SDMetadata = SDMetadata
   , sdNegativePrompt :: (String, [SDExtension])
   , sdSteps :: Int
   , sdSampler :: String
-  , sdCfgScale :: Int
+  , sdCfgScale :: FloatString
   , sdSeed :: Int
   , sdFaceRestoration :: String
   , sdSize :: (Int, Int)
   , sdModelHash :: String
   , sdModel :: String
   , sdClipSkip :: Maybe Int
-  , sdCfgRescalePhi :: Maybe Int
+  , sdCfgRescalePhi :: Maybe FloatString
   , sdLoraHashes :: [(String, String)]
   , sdVersion :: String
   , sdPositiveTemplate :: (String, [SDExtension])
@@ -142,7 +175,7 @@ emptySdMetadata =
     , sdNegativePrompt = ("", [])
     , sdSteps = 0
     , sdSampler = ""
-    , sdCfgScale = 0
+    , sdCfgScale = read "0"
     , sdSeed = 0
     , sdFaceRestoration = ""
     , sdSize = (0, 0)
@@ -233,27 +266,6 @@ removeTextWeights = go ""
     (stripSdWeightedText -> Just (rest, weighted)) -> go (reverse (sdText weighted) ++ acc) rest
     (c : rest) -> go (c : acc) rest
     [] -> reverse acc
-
-isDecimalNumber :: String -> Bool
-isDecimalNumber ('-' : rest) = isDecimalNumber rest
-isDecimalNumber s = case partition (== '.') s of
-  ('.' : '.' : _, _) -> False
-  (_, s') -> all (`elem` ['0' .. '9']) s'
-
-trim :: String -> String
-trim = f . f
- where
-  f = reverse . dropWhile (== ' ')
-
--- trims front and tail and squishes multiple spaces into one
--- replaces all non-space whitespace with spaces
-trimHeavy :: String -> String
-trimHeavy = unwords . words
-
-myRead :: HasCallStack => Read a => String -> a
-myRead s = case reads s of
-  [(x, "")] -> x
-  _ -> error $ "myRead: cannot read " ++ show s
 
 massageLines :: HasCallStack => String -> String
 massageLines = go
