@@ -31,6 +31,7 @@ import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf, partition, sort, 
 import Data.List.Split (splitOn)
 import Data.Maybe (catMaybes)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
+import GHC.Stack (HasCallStack)
 import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
@@ -170,7 +171,7 @@ data SDExtension = SDExtension
   }
   deriving (Show)
 
-stripSdExtension :: String -> Maybe (String, SDExtension)
+stripSdExtension :: HasCallStack => String -> Maybe (String, SDExtension)
 stripSdExtension = \case
   '<' : rest ->
     let (name, rest') = spanItem rest
@@ -179,7 +180,7 @@ stripSdExtension = \case
  where
   spanItem = span (`notElem` (":>" :: String))
 
-  go :: [String] -> String -> Maybe (String, SDExtension)
+  go :: HasCallStack => [String] -> String -> Maybe (String, SDExtension)
   go acc = \case
     ':' : argBegin ->
       let (arg, rest) = spanItem argBegin
@@ -190,7 +191,7 @@ stripSdExtension = \case
     _ -> Nothing
 
 -- Removes the extension encoding from the input string and returns the extensions.
-extractSdExtensions :: String -> (String, [SDExtension])
+extractSdExtensions :: HasCallStack => String -> (String, [SDExtension])
 extractSdExtensions = go ("", [])
  where
   go (accText, accExts) = \case
@@ -206,14 +207,14 @@ data SDWeightedText = SDWeightedText
   deriving (Show)
 
 -- Doesn't handle nested weighted text
-stripSdWeightedText :: String -> Maybe (String, SDWeightedText)
+stripSdWeightedText :: HasCallStack => String -> Maybe (String, SDWeightedText)
 stripSdWeightedText = \case
   '(' : rest ->
     let (text, rest') = span (`notElem` ":)") rest
      in go text "1.1" rest'
   _ -> Nothing
  where
-  go :: String -> String -> String -> Maybe (String, SDWeightedText)
+  go :: HasCallStack => String -> String -> String -> Maybe (String, SDWeightedText)
   go text weight = \case
     ':' : weightBegin ->
       let (weight', rest) = span (/= ')') weightBegin
@@ -225,7 +226,7 @@ stripSdWeightedText = \case
     _ -> Nothing
 
 -- Removes the weighted text encoding from the input string
-removeTextWeights :: String -> String
+removeTextWeights :: HasCallStack => String -> String
 removeTextWeights = go ""
  where
   go acc = \case
@@ -249,7 +250,12 @@ trim = f . f
 trimHeavy :: String -> String
 trimHeavy = unwords . words
 
-massageLines :: String -> String
+myRead :: HasCallStack => Read a => String -> a
+myRead s = case reads s of
+  [(x, "")] -> x
+  _ -> error $ "myRead: cannot read " ++ show s
+
+massageLines :: HasCallStack => String -> String
 massageLines = go
  where
   go = \case
@@ -262,7 +268,7 @@ massageLines = go
     c : rest -> c : go rest
     [] -> []
 
-splitUnquotedCommas :: String -> [String]
+splitUnquotedCommas :: HasCallStack => String -> [String]
 splitUnquotedCommas = go [] "" False
  where
   go spine word inQuote = \case
@@ -274,26 +280,27 @@ splitUnquotedCommas = go [] "" False
       "" -> spine
       _ -> word : spine
 
-parseSdMetadata :: String -> SDMetadata
+parseSdMetadata :: HasCallStack => String -> SDMetadata
 parseSdMetadata text = foldl' accumSdMetadata emptySdMetadata theLines
  where
   theLines = map trim case lines text of
-    pos : neg : commaDelimJunk : rest -> pos : neg : splitUnquotedCommas commaDelimJunk ++ rest
+    pos : (viewNegativePrompt -> Just neg) : commaDelimJunk : rest -> pos : neg : splitUnquotedCommas commaDelimJunk ++ rest
+    pos : commaDelimJunk : rest -> pos : splitUnquotedCommas commaDelimJunk ++ rest
     _ -> error "parseSdMetadata: not enough lines"
 
-accumSdMetadata :: SDMetadata -> String -> SDMetadata
+accumSdMetadata :: HasCallStack => SDMetadata -> String -> SDMetadata
 accumSdMetadata sd theLine = case theLine of
   (goEntry KeyNegativePrompt -> Just entry) -> sd{sdNegativePrompt = extractSdExtensions $ sdValue entry}
-  (goEntry KeySteps -> Just entry) -> sd{sdSteps = read $ sdValue entry}
+  (goEntry KeySteps -> Just entry) -> sd{sdSteps = myRead $ sdValue entry}
   (goEntry KeySampler -> Just entry) -> sd{sdSampler = sdValue entry}
-  (goEntry KeyCFGScale -> Just entry) -> sd{sdCfgScale = read $ sdValue entry}
-  (goEntry KeySeed -> Just entry) -> sd{sdSeed = read $ sdValue entry}
+  (goEntry KeyCFGScale -> Just entry) -> sd{sdCfgScale = myRead $ sdValue entry}
+  (goEntry KeySeed -> Just entry) -> sd{sdSeed = myRead $ sdValue entry}
   (goEntry KeyFaceRestoration -> Just entry) -> sd{sdFaceRestoration = sdValue entry}
   (goEntry KeySize -> Just entry) -> sd{sdSize = readSize $ sdValue entry}
   (goEntry KeyModelHash -> Just entry) -> sd{sdModelHash = sdValue entry}
   (goEntry KeyModel -> Just entry) -> sd{sdModel = sdValue entry}
-  (goEntry KeyClipSkip -> Just entry) -> sd{sdClipSkip = Just $ read $ sdValue entry}
-  (goEntry KeyCFGRescalePhi -> Just entry) -> sd{sdCfgRescalePhi = Just $ read $ sdValue entry}
+  (goEntry KeyClipSkip -> Just entry) -> sd{sdClipSkip = Just $ myRead $ sdValue entry}
+  (goEntry KeyCFGRescalePhi -> Just entry) -> sd{sdCfgRescalePhi = Just $ myRead $ sdValue entry}
   (goEntry KeyLoraHashes -> Just entry) -> sd{sdLoraHashes = readLoraHashes $ sdValue entry}
   (goEntry KeyVersion -> Just entry) -> sd{sdVersion = sdValue entry}
   (goEntry KeyTemplate -> Just entry) -> sd{sdPositiveTemplate = extractSdExtensions $ sdValue entry}
@@ -306,32 +313,42 @@ accumSdMetadata sd theLine = case theLine of
  where
   goEntry = parseSdMetadataEntry . keyToText
 
-parseSdMetadataEntry :: String -> String -> Maybe SDMetadataEntry
+parseSdMetadataEntry :: HasCallStack => String -> String -> Maybe SDMetadataEntry
 parseSdMetadataEntry key text = case stripPrefix key' text of
   Nothing -> Nothing
   Just text' -> Just $ SDMetadataEntry key $ trim text'
  where
   key' = key ++ ":"
 
-readSize :: String -> (Int, Int)
-readSize text = (read w, read h)
+isNegativePrompt :: HasCallStack => String -> Bool
+isNegativePrompt s = case parseSdMetadataEntry (keyToText KeyNegativePrompt) s of
+  Just _ -> True
+  Nothing -> False
+
+viewNegativePrompt :: HasCallStack => String -> Maybe String
+viewNegativePrompt s = case isNegativePrompt s of
+  True -> Just s
+  False -> Nothing
+
+readSize :: HasCallStack => String -> (Int, Int)
+readSize text = (myRead w, myRead h)
  where
   (w, _ : h) = break (== 'x') text
 
-readLoraHashes :: String -> [(String, String)]
+readLoraHashes :: HasCallStack => String -> [(String, String)]
 readLoraHashes text = map readLoraHash $ splitOn "," text
 
-readLoraHash :: String -> (String, String)
+readLoraHash :: HasCallStack => String -> (String, String)
 readLoraHash text = (key, trim value)
  where
   (key, _ : value) = break (== ':') text
 
-inlineSdExtensions :: (String, [SDExtension]) -> String
+inlineSdExtensions :: HasCallStack => (String, [SDExtension]) -> String
 inlineSdExtensions (text, exts) = text ++ concatMap inlineSdExtension exts
  where
   inlineSdExtension (SDExtension name args) = " <" ++ name ++ concatMap (':' :) args ++ ">"
 
-toParameters :: SDMetadata -> (J.Keys J.Value, J.Value)
+toParameters :: HasCallStack => SDMetadata -> (J.Keys J.Value, J.Value)
 toParameters sd = (J.Unknown "parameters", value)
  where
   showKey key str = Just $ keyToText key ++ ": " ++ str
@@ -371,7 +388,7 @@ toParameters sd = (J.Unknown "parameters", value)
       , showKey KeyVersion $ sdVersion sd
       ]
 
-prettySdMetadata :: Bool -> [Key] -> SDMetadata -> String
+prettySdMetadata :: HasCallStack => Bool -> [Key] -> SDMetadata -> String
 prettySdMetadata includeKey whitelist sd =
   intercalate "\n" $
     catMaybes
@@ -415,7 +432,7 @@ prettySdMetadata includeKey whitelist sd =
     [] -> True
     _ -> key `elem` whitelist
 
-applyToMetadatas :: SDMetadata -> J.Metadatas -> J.Metadatas
+applyToMetadatas :: HasCallStack => SDMetadata -> J.Metadatas -> J.Metadatas
 applyToMetadatas sd md =
   foldr
     ($)
@@ -426,27 +443,27 @@ applyToMetadatas sd md =
     , J.insert J.Format J.SourcePng
     ]
 
-editSdMetadata :: (Key, String) -> SDMetadata -> SDMetadata
+editSdMetadata :: HasCallStack => (Key, String) -> SDMetadata -> SDMetadata
 editSdMetadata (key, val) sd = case key of
   KeyPositivePrompt -> sd{sdPositivePrompt = extractSdExtensions val}
   KeyNegativePrompt -> sd{sdNegativePrompt = extractSdExtensions val}
-  KeySteps -> sd{sdSteps = read val}
+  KeySteps -> sd{sdSteps = myRead val}
   KeySampler -> sd{sdSampler = val}
-  KeyCFGScale -> sd{sdCfgScale = read val}
-  KeySeed -> sd{sdSeed = read val}
+  KeyCFGScale -> sd{sdCfgScale = myRead val}
+  KeySeed -> sd{sdSeed = myRead val}
   KeyFaceRestoration -> sd{sdFaceRestoration = val}
   KeySize -> sd{sdSize = readSize val}
   KeyModelHash -> sd{sdModelHash = val}
   KeyModel -> sd{sdModel = val}
-  KeyClipSkip -> sd{sdClipSkip = Just $ read val}
-  KeyCFGRescalePhi -> sd{sdCfgRescalePhi = Just $ read val}
+  KeyClipSkip -> sd{sdClipSkip = Just $ myRead val}
+  KeyCFGRescalePhi -> sd{sdCfgRescalePhi = Just $ myRead val}
   KeyLoraHashes -> sd{sdLoraHashes = readLoraHashes val}
   KeyVersion -> sd{sdVersion = val}
   KeyTemplate -> sd{sdPositiveTemplate = extractSdExtensions val}
   KeyNegativeTemplate -> sd{sdNegativeTemplate = extractSdExtensions val}
   KeyControlNet0 -> sd{sdControlNet0 = Just val}
 
-removeMetadataPromptWeights :: SDMetadata -> SDMetadata
+removeMetadataPromptWeights :: HasCallStack => SDMetadata -> SDMetadata
 removeMetadataPromptWeights sd = sd'
  where
   (posPromptText, posPromptExts) = sdPositivePrompt sd
@@ -556,7 +573,7 @@ helpMessage =
  where
   showKey key = "\"" ++ keyToText key ++ "\""
 
-parseCliOpts :: [String] -> Either String CLIOpts
+parseCliOpts :: HasCallStack => [String] -> Either String CLIOpts
 parseCliOpts = go' <=< go emptyCliOpts
  where
   go opts = \case
@@ -612,7 +629,7 @@ looksLikeDir path = case reverse path of
   '\\' : _ -> True
   _ -> False
 
-validateBatch :: Either String CLIOpts -> IO (Either String CLIOpts)
+validateBatch :: HasCallStack => Either String CLIOpts -> IO (Either String CLIOpts)
 validateBatch eOpts = do
   let validateInputImage o = case optInputImage o of
         path ->
@@ -651,7 +668,7 @@ validateBatch eOpts = do
       True -> foldM go eOpts checks
       False -> pure eOpts
 
-forceEvalImage :: Image PixelRGBA8 -> IO ()
+forceEvalImage :: HasCallStack => Image PixelRGBA8 -> IO ()
 forceEvalImage image = do
   -- unable to use anything NFData-related because of dependency import problems
   let (w, h) = (imageWidth image, imageHeight image)
@@ -667,7 +684,7 @@ forceEvalImage image = do
           go (x + 1) y
   go 0 0
 
-forceEvalMetadatas :: J.Metadatas -> IO ()
+forceEvalMetadatas :: HasCallStack => J.Metadatas -> IO ()
 forceEvalMetadatas metadatas = do
   -- unable to use anything NFData-related because of dependency import problems
   _ <- evaluate $ length $ show metadatas
@@ -685,13 +702,13 @@ mkSuffixPatterns = map (tail . dropWhile (/= patternWildcard))
 makePatternPairs :: [String] -> [(String, String)]
 makePatternPairs patterns = zip (mkPrefixPatterns patterns) (mkSuffixPatterns patterns)
 
-readPatternPairs :: FilePath -> IO [(String, String)]
+readPatternPairs :: HasCallStack => FilePath -> IO [(String, String)]
 readPatternPairs path = do
   contents <- readFile path
   let patterns = filter (not . null) $ map trim $ lines contents
   pure $ makePatternPairs patterns
 
-extractSubject :: [(String, String)] -> String -> Maybe String
+extractSubject :: HasCallStack => [(String, String)] -> String -> Maybe String
 extractSubject [] str = Just str
 extractSubject patternPairs str = msum do
   (prefix, suffix) <- patternPairs
@@ -707,7 +724,7 @@ data DoSingle = DoSingle
   , onePatternPairs :: [(String, String)]
   }
 
-doSingle :: CLIOpts -> DoSingle -> MaybeT IO ()
+doSingle :: HasCallStack => CLIOpts -> DoSingle -> MaybeT IO ()
 doSingle opts single = do
   let inputFile = oneInputImage single
   let mOutputImage = oneOutputImage single
@@ -780,7 +797,7 @@ isPng path = ext == ".png" || ext == ".PNG"
 
 type Logger = String -> IO ()
 
-doBatch :: CLIOpts -> Logger -> [(String, String)] -> IO ()
+doBatch :: HasCallStack => CLIOpts -> Logger -> [(String, String)] -> IO ()
 doBatch opts logger patternPairs = do
   when (optCreateMissingDirs opts) do
     case optOutputImage opts of
@@ -813,7 +830,7 @@ doBatch opts logger patternPairs = do
           Just () -> pure ()
   mapM_ (uncurry doOne) $ zip inputFiles' [1 :: Int ..]
 
-doNonBatch :: CLIOpts -> Logger -> [(String, String)] -> IO ()
+doNonBatch :: HasCallStack => CLIOpts -> Logger -> [(String, String)] -> IO ()
 doNonBatch opts logger patternPairs = do
   let inputFile = optInputImage opts
   let outputFile = optOutputImage opts
@@ -840,7 +857,7 @@ doNonBatch opts logger patternPairs = do
     Nothing -> exitFailure
     Just () -> pure ()
 
-main :: IO ()
+main :: HasCallStack => IO ()
 main = do
   setLocaleEncoding utf8
   fmap parseCliOpts getArgs >>= validateBatch >>= \case
