@@ -19,6 +19,7 @@
     "uncurry",
     "unlines",
     "unrecognised",
+    "untokenize",
     "unwords"
   ],
   "editor.tabSize": 2

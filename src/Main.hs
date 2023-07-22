@@ -67,6 +67,7 @@ data Key
   | KeyVersion
   | KeyTemplate
   | KeyNegativeTemplate
+  | KeyControlNet0
   deriving (Bounded, Enum, Eq, Ord, Show)
 
 keyToText :: Key -> String
@@ -87,6 +88,30 @@ keyToText key = case key of
   KeyVersion -> "Version"
   KeyTemplate -> "Template"
   KeyNegativeTemplate -> "Negative Template"
+  KeyControlNet0 -> "ControlNet 0"
+
+textToKey :: String -> Maybe Key
+textToKey key = case key of
+  (eq KeyPositivePrompt -> True) -> Just KeyPositivePrompt
+  (eq KeyNegativePrompt -> True) -> Just KeyNegativePrompt
+  (eq KeySteps -> True) -> Just KeySteps
+  (eq KeySampler -> True) -> Just KeySampler
+  (eq KeyCFGScale -> True) -> Just KeyCFGScale
+  (eq KeySeed -> True) -> Just KeySeed
+  (eq KeyFaceRestoration -> True) -> Just KeyFaceRestoration
+  (eq KeySize -> True) -> Just KeySize
+  (eq KeyModelHash -> True) -> Just KeyModelHash
+  (eq KeyModel -> True) -> Just KeyModel
+  (eq KeyClipSkip -> True) -> Just KeyClipSkip
+  (eq KeyCFGRescalePhi -> True) -> Just KeyCFGRescalePhi
+  (eq KeyLoraHashes -> True) -> Just KeyLoraHashes
+  (eq KeyVersion -> True) -> Just KeyVersion
+  (eq KeyTemplate -> True) -> Just KeyTemplate
+  (eq KeyNegativeTemplate -> True) -> Just KeyNegativeTemplate
+  (eq KeyControlNet0 -> True) -> Just KeyControlNet0
+  _ -> Nothing
+ where
+  eq k s = keyToText k == s
 
 data SDMetadata = SDMetadata
   { sdPositivePrompt :: (String, [SDExtension])
@@ -105,6 +130,7 @@ data SDMetadata = SDMetadata
   , sdVersion :: String
   , sdPositiveTemplate :: (String, [SDExtension])
   , sdNegativeTemplate :: (String, [SDExtension])
+  , sdControlNet0 :: Maybe String
   }
   deriving (Show)
 
@@ -127,6 +153,7 @@ emptySdMetadata =
     , sdVersion = ""
     , sdPositiveTemplate = ("", [])
     , sdNegativeTemplate = ("", [])
+    , sdControlNet0 = Nothing
     }
 
 data SDMetadataEntry = SDMetadataEntry
@@ -194,11 +221,23 @@ massageLines = go
     c : rest -> c : go rest
     [] -> []
 
+splitUnquotedCommas :: String -> [String]
+splitUnquotedCommas = go [] "" False
+ where
+  go spine word inQuote = \case
+    ',' : rest | not inQuote -> go (word : spine) "" False rest
+    '"' : rest | inQuote -> go spine ('"' : word) False rest
+    '"' : rest -> go spine ('"' : word) True rest
+    c : rest -> go spine (c : word) inQuote rest
+    [] -> reverse $ map reverse case word of
+      "" -> spine
+      _ -> word : spine
+
 parseSdMetadata :: String -> SDMetadata
 parseSdMetadata text = foldl' accumSdMetadata emptySdMetadata theLines
  where
   theLines = map trim case lines text of
-    pos : neg : commaDelimJunk : rest -> pos : neg : splitOn "," commaDelimJunk ++ rest
+    pos : neg : commaDelimJunk : rest -> pos : neg : splitUnquotedCommas commaDelimJunk ++ rest
     _ -> error "parseSdMetadata: not enough lines"
 
 accumSdMetadata :: SDMetadata -> String -> SDMetadata
@@ -218,6 +257,7 @@ accumSdMetadata sd theLine = case theLine of
   (goEntry KeyVersion -> Just entry) -> sd{sdVersion = sdValue entry}
   (goEntry KeyTemplate -> Just entry) -> sd{sdPositiveTemplate = extractSdExtensions $ sdValue entry}
   (goEntry KeyNegativeTemplate -> Just entry) -> sd{sdNegativeTemplate = extractSdExtensions $ sdValue entry}
+  (goEntry KeyControlNet0 -> Just entry) -> sd{sdControlNet0 = Just $ sdValue entry}
   -- KeyPositivePrompt is not keyed by string, so we have to do this special case
   _ -> case sdPositivePrompt sd of
     ("", []) -> sd{sdPositivePrompt = extractSdExtensions theLine}
@@ -290,8 +330,8 @@ toParameters sd = (J.Unknown "parameters", value)
       , showKey KeyVersion $ sdVersion sd
       ]
 
-prettySdMetadata :: SDMetadata -> String
-prettySdMetadata sd =
+prettySdMetadata :: Bool -> [Key] -> SDMetadata -> String
+prettySdMetadata includeKey whitelist sd =
   intercalate "\n" $
     catMaybes
       [ showKey KeyPositivePrompt $ inlineSdExtensions (sdPositivePrompt sd)
@@ -306,6 +346,9 @@ prettySdMetadata sd =
       , showKey KeySize $ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
       , showKey KeyModelHash $ sdModelHash sd
       , showKey KeyModel $ sdModel sd
+      , case sdControlNet0 sd of
+          Nothing -> Nothing
+          Just controlNet0 -> showKey KeyControlNet0 controlNet0
       , case sdClipSkip sd of
           Nothing -> Nothing
           Just clipSkip -> showKey KeyClipSkip $ show clipSkip
@@ -322,7 +365,14 @@ prettySdMetadata sd =
           else showKey KeyNegativeTemplate $ inlineSdExtensions (sdNegativeTemplate sd)
       ]
  where
-  showKey key str = Just $ keyToText key ++ ": " ++ str
+  showKey key str = case allowed key of
+    True -> Just case includeKey of
+      True -> keyToText key ++ ": " ++ str
+      False -> str
+    False -> Nothing
+  allowed key = case whitelist of
+    [] -> True
+    _ -> key `elem` whitelist
 
 applyToMetadatas :: SDMetadata -> J.Metadatas -> J.Metadatas
 applyToMetadatas sd md =
@@ -335,26 +385,25 @@ applyToMetadatas sd md =
     , J.insert J.Format J.SourcePng
     ]
 
-editSdMetadata :: (String, String) -> SDMetadata -> SDMetadata
-editSdMetadata (key, val) = case key of
-  (eq KeyPositivePrompt -> True) -> \sd -> sd{sdPositivePrompt = extractSdExtensions val}
-  (eq KeyNegativePrompt -> True) -> \sd -> sd{sdNegativePrompt = extractSdExtensions val}
-  (eq KeySteps -> True) -> \sd -> sd{sdSteps = read val}
-  (eq KeySampler -> True) -> \sd -> sd{sdSampler = val}
-  (eq KeyCFGScale -> True) -> \sd -> sd{sdCfgScale = read val}
-  (eq KeySeed -> True) -> \sd -> sd{sdSeed = read val}
-  (eq KeySize -> True) -> \sd -> sd{sdSize = readSize val}
-  (eq KeyModelHash -> True) -> \sd -> sd{sdModelHash = val}
-  (eq KeyModel -> True) -> \sd -> sd{sdModel = val}
-  (eq KeyClipSkip -> True) -> \sd -> sd{sdClipSkip = Just $ read val}
-  (eq KeyCFGRescalePhi -> True) -> \sd -> sd{sdCfgRescalePhi = Just $ read val}
-  (eq KeyLoraHashes -> True) -> \sd -> sd{sdLoraHashes = readLoraHashes val}
-  (eq KeyVersion -> True) -> \sd -> sd{sdVersion = val}
-  (eq KeyTemplate -> True) -> \sd -> sd{sdPositiveTemplate = extractSdExtensions val}
-  (eq KeyNegativeTemplate -> True) -> \sd -> sd{sdNegativeTemplate = extractSdExtensions val}
-  _ -> error $ "Unknown key: " ++ key
- where
-  eq k s = keyToText k == s
+editSdMetadata :: (Key, String) -> SDMetadata -> SDMetadata
+editSdMetadata (key, val) sd = case key of
+  KeyPositivePrompt -> sd{sdPositivePrompt = extractSdExtensions val}
+  KeyNegativePrompt -> sd{sdNegativePrompt = extractSdExtensions val}
+  KeySteps -> sd{sdSteps = read val}
+  KeySampler -> sd{sdSampler = val}
+  KeyCFGScale -> sd{sdCfgScale = read val}
+  KeySeed -> sd{sdSeed = read val}
+  KeyFaceRestoration -> sd{sdFaceRestoration = val}
+  KeySize -> sd{sdSize = readSize val}
+  KeyModelHash -> sd{sdModelHash = val}
+  KeyModel -> sd{sdModel = val}
+  KeyClipSkip -> sd{sdClipSkip = Just $ read val}
+  KeyCFGRescalePhi -> sd{sdCfgRescalePhi = Just $ read val}
+  KeyLoraHashes -> sd{sdLoraHashes = readLoraHashes val}
+  KeyVersion -> sd{sdVersion = val}
+  KeyTemplate -> sd{sdPositiveTemplate = extractSdExtensions val}
+  KeyNegativeTemplate -> sd{sdNegativeTemplate = extractSdExtensions val}
+  KeyControlNet0 -> sd{sdControlNet0 = Just val}
 
 data CLIOpts = CLIOpts
   { optHelp :: Bool
@@ -362,13 +411,14 @@ data CLIOpts = CLIOpts
   , optOutputImage :: Maybe FilePath
   , optOutputCaption :: Maybe FilePath
   , optPrint :: Bool
+  , optPrintKey :: [Key]
   , optLogFile :: Maybe FilePath
   , optPatternFile :: Maybe FilePath
   , optOverwriteInput :: Bool
   , optBatch :: Bool
   , optForce :: Bool
   , optCreateMissingDirs :: Bool
-  , optEdit :: [(String, String)]
+  , optEdit :: [(Key, String)]
   }
   deriving (Show)
 
@@ -380,6 +430,7 @@ emptyCliOpts =
     , optOutputImage = Nothing
     , optOutputCaption = Nothing
     , optPrint = False
+    , optPrintKey = []
     , optLogFile = Nothing
     , optPatternFile = Nothing
     , optOverwriteInput = False
@@ -398,6 +449,7 @@ emptyCliOpts =
 --   --output-image        Output image file path.
 --   --output-caption      Output caption file path.
 --   --print               Print the metadata to stdout.
+--   --print-key <key>     Print the metadata key to stdout.
 --   --log-file            Log file path.
 --   --pattern-file        Pattern file path for caption output.
 --   --overwrite-input     Overwrite the input image with the metadata.
@@ -428,6 +480,7 @@ helpMessage =
     , "  --log-file            Log file path."
     , "  --pattern-file        Pattern file path for caption output."
     , "  --print               Print the input image metadata to stdout."
+    , "  --print-key <key>     Print the input image metadata key to stdout."
     , "  --overwrite-input     Overwrite the input image with the metadata."
     , "  --batch               Batch mode. Specified files must be directories."
     , "  --force               Disable all overwrite checks."
@@ -456,11 +509,16 @@ parseCliOpts = go' <=< go emptyCliOpts
     "--log-file" : path : rest -> go opts{optLogFile = Just path} rest
     "--pattern-file" : path : rest -> go opts{optPatternFile = Just path} rest
     "--print" : rest -> go opts{optPrint = True} rest
+    "--print-key" : key : rest -> case toKey key of
+      Right key' -> go opts{optPrintKey = key' : optPrintKey opts} rest
+      Left err -> Left err
     "--overwrite-input" : rest -> go opts{optOverwriteInput = True} rest
     "--batch" : rest -> go opts{optBatch = True} rest
     "--force" : rest -> go opts{optForce = True} rest
     "--create-missing-dirs" : rest -> go opts{optCreateMissingDirs = True} rest
-    "--edit" : key : value : rest -> go opts{optEdit = (key, value) : optEdit opts} rest
+    "--edit" : key : value : rest -> case toKey key of
+      Right key' -> go opts{optEdit = (key', value) : optEdit opts} rest
+      Left err -> Left err
     arg : rest -> Left $ "Unexpected argument: " ++ show (arg : rest)
     [] -> Right opts
   go' opts = do
@@ -472,17 +530,22 @@ parseCliOpts = go' <=< go emptyCliOpts
           True -> case optOutputImage o of
             Nothing -> Right o{optOutputImage = Just $ optInputImage o}
             Just _ -> Left "Cannot overwrite input image when output image is specified"
-    let handleSpecialPrint o = case (optOutputImage o, optOutputCaption o, optBatch o) of
-          (Nothing, Nothing, False) -> Right o{optPrint = True}
+    let handleSpecialPrint o = case (optOutputImage o, optOutputCaption o, optBatch o, optPrintKey o) of
+          (Nothing, Nothing, False, []) -> Right o{optPrint = True}
           _ -> Right o
+    let fixPrintKeyOrder o = Right o{optPrintKey = reverse $ optPrintKey o}
     let fixups =
           [ validateInput
           , handleOverwrite
           , handleSpecialPrint
+          , fixPrintKeyOrder
           ]
     if optHelp opts
       then pure opts
       else foldM (\o f -> f o) opts fixups
+  toKey key = case textToKey key of
+    Nothing -> Left $ "Unknown key: " ++ key
+    Just key' -> Right key'
 
 looksLikeDir :: FilePath -> Bool
 looksLikeDir path = case reverse path of
@@ -613,7 +676,10 @@ doSingle opts single = do
           let text' = massageLines text
           let sd = parseSdMetadata text'
           when (optPrint opts) do
-            liftIO $ putStrLn $ prettySdMetadata sd
+            liftIO $ putStrLn $ prettySdMetadata True [] sd
+          case optPrintKey opts of
+            [] -> pure ()
+            keys -> liftIO $ putStrLn $ prettySdMetadata False keys sd
           let sd' = foldr editSdMetadata sd (optEdit opts)
           let metadatas' = applyToMetadatas sd' metadatas
           liftIO $ forceEvalMetadatas metadatas' -- forces out error messages before we start writing files

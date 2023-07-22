@@ -15,6 +15,7 @@ Options
   --log-file            Log file path.
   --pattern-file        Pattern file path for caption output.
   --print               Print the input image metadata to stdout.
+  --print-key <key>     Print the input image metadata key to stdout.
   --overwrite-input     Overwrite the input image with the metadata.
   --batch               Batch mode. Specified files must be directories.
   --force               Disable all overwrite checks.
@@ -44,4 +45,5 @@ Supported keys:
   "Version"
   "Template"
   "Negative Template"
+  "ControlNet 0"
 ```
