@@ -29,6 +29,7 @@ import Control.Monad.Trans.Maybe (MaybeT (runMaybeT))
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf, partition, sort, stripPrefix)
 import Data.List.Split (splitOn)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
 import GHC.Stack (HasCallStack)
@@ -101,8 +102,8 @@ data Key
   | KeyVersion
   | KeyTemplate
   | KeyNegativeTemplate
-  | KeyControlNet0
-  deriving (Bounded, Enum, Eq, Ord, Show)
+  | KeyControlNet (Maybe Int)
+  deriving (Eq, Ord, Show)
 
 keyToText :: Key -> String
 keyToText key = case key of
@@ -122,7 +123,8 @@ keyToText key = case key of
   KeyVersion -> "Version"
   KeyTemplate -> "Template"
   KeyNegativeTemplate -> "Negative Template"
-  KeyControlNet0 -> "ControlNet 0"
+  KeyControlNet Nothing -> "ControlNet"
+  KeyControlNet (Just n) -> "ControlNet " ++ show n
 
 textToKey :: String -> Maybe Key
 textToKey key = case key of
@@ -142,10 +144,19 @@ textToKey key = case key of
   (eq KeyVersion -> True) -> Just KeyVersion
   (eq KeyTemplate -> True) -> Just KeyTemplate
   (eq KeyNegativeTemplate -> True) -> Just KeyNegativeTemplate
-  (eq KeyControlNet0 -> True) -> Just KeyControlNet0
+  (eqKeyControlNet -> Just n) -> Just $ KeyControlNet n
   _ -> Nothing
  where
   eq k s = keyToText k == s
+  eqKeyControlNet s = case stripPrefix (keyToText $ KeyControlNet Nothing) s of
+    Nothing -> Nothing
+    Just s' -> case stripPrefix " " s' of
+      Nothing -> case s' of
+        "" -> Just Nothing
+        _ -> Nothing
+      Just s'' -> case all (`elem` ['0' .. '9']) s'' of
+        True -> Just $ Just $ myRead s''
+        False -> Nothing
 
 data SDMetadata = SDMetadata
   { sdPositivePrompt :: (String, [SDExtension])
@@ -164,7 +175,7 @@ data SDMetadata = SDMetadata
   , sdVersion :: String
   , sdPositiveTemplate :: (String, [SDExtension])
   , sdNegativeTemplate :: (String, [SDExtension])
-  , sdControlNet0 :: Maybe String
+  , sdControlNets :: Map.Map (Maybe Int) String
   }
   deriving (Show)
 
@@ -187,7 +198,7 @@ emptySdMetadata =
     , sdVersion = ""
     , sdPositiveTemplate = ("", [])
     , sdNegativeTemplate = ("", [])
-    , sdControlNet0 = Nothing
+    , sdControlNets = Map.empty
     }
 
 data SDMetadataEntry = SDMetadataEntry
@@ -317,7 +328,17 @@ accumSdMetadata sd theLine = case theLine of
   (goEntry KeyVersion -> Just entry) -> sd{sdVersion = sdValue entry}
   (goEntry KeyTemplate -> Just entry) -> sd{sdPositiveTemplate = extractSdExtensions $ sdValue entry}
   (goEntry KeyNegativeTemplate -> Just entry) -> sd{sdNegativeTemplate = extractSdExtensions $ sdValue entry}
-  (goEntry KeyControlNet0 -> Just entry) -> sd{sdControlNet0 = Just $ sdValue entry}
+  (goEntry (KeyControlNet Nothing) -> Just entry) -> sd{sdControlNets = Map.insert Nothing (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 0)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 0) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 1)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 1) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 2)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 2) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 3)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 3) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 4)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 4) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 5)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 5) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 6)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 6) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 7)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 7) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 8)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 8) (sdValue entry) $ sdControlNets sd}
+  (goEntry (KeyControlNet (Just 9)) -> Just entry) -> sd{sdControlNets = Map.insert (Just 9) (sdValue entry) $ sdControlNets sd}
   -- KeyPositivePrompt is not keyed by string, so we have to do this special case
   _ -> case sdPositivePrompt sd of
     ("", []) -> sd{sdPositivePrompt = extractSdExtensions theLine}
@@ -403,7 +424,7 @@ toParameters sd = (J.Unknown "parameters", value)
 prettySdMetadata :: HasCallStack => Bool -> [Key] -> SDMetadata -> String
 prettySdMetadata includeKey whitelist sd =
   intercalate "\n" $
-    catMaybes
+    concat
       [ showKey KeyPositivePrompt $ inlineSdExtensions (sdPositivePrompt sd)
       , showKey KeyNegativePrompt $ inlineSdExtensions (sdNegativePrompt sd)
       , showKey KeySteps $ show (sdSteps sd)
@@ -411,35 +432,35 @@ prettySdMetadata includeKey whitelist sd =
       , showKey KeyCFGScale $ show (sdCfgScale sd)
       , showKey KeySeed $ show (sdSeed sd)
       , case sdFaceRestoration sd of
-          "" -> Nothing
+          "" -> []
           face -> showKey KeyFaceRestoration face
       , showKey KeySize $ show (fst $ sdSize sd) ++ "x" ++ show (snd $ sdSize sd)
       , showKey KeyModelHash $ sdModelHash sd
       , showKey KeyModel $ sdModel sd
-      , case sdControlNet0 sd of
-          Nothing -> Nothing
-          Just controlNet0 -> showKey KeyControlNet0 controlNet0
+      , case Map.toList $ sdControlNets sd of
+          [] -> []
+          cns -> concatMap (\(n, cn) -> showKey (KeyControlNet n) cn) cns
       , case sdClipSkip sd of
-          Nothing -> Nothing
+          Nothing -> []
           Just clipSkip -> showKey KeyClipSkip $ show clipSkip
       , case sdCfgRescalePhi sd of
-          Nothing -> Nothing
+          Nothing -> []
           Just phi -> showKey KeyCFGRescalePhi $ show phi
       , showKey KeyLoraHashes $ intercalate "," (map (\(k, v) -> k ++ ": " ++ v) $ sdLoraHashes sd)
       , showKey KeyVersion $ sdVersion sd
       , if null $ sdPositiveTemplate sd
-          then Nothing
+          then []
           else showKey KeyTemplate $ inlineSdExtensions (sdPositiveTemplate sd)
       , if null $ sdNegativeTemplate sd
-          then Nothing
+          then []
           else showKey KeyNegativeTemplate $ inlineSdExtensions (sdNegativeTemplate sd)
       ]
  where
   showKey key str = case allowed key of
-    True -> Just case includeKey of
+    True -> pure case includeKey of
       True -> keyToText key ++ ": " ++ str
       False -> str
-    False -> Nothing
+    False -> []
   allowed key = case whitelist of
     [] -> True
     _ -> key `elem` whitelist
@@ -473,7 +494,7 @@ editSdMetadata (key, val) sd = case key of
   KeyVersion -> sd{sdVersion = val}
   KeyTemplate -> sd{sdPositiveTemplate = extractSdExtensions val}
   KeyNegativeTemplate -> sd{sdNegativeTemplate = extractSdExtensions val}
-  KeyControlNet0 -> sd{sdControlNet0 = Just val}
+  KeyControlNet n -> sd{sdControlNets = Map.insert n val $ sdControlNets sd}
 
 removeMetadataPromptWeights :: HasCallStack => SDMetadata -> SDMetadata
 removeMetadataPromptWeights sd = sd'
@@ -580,10 +601,31 @@ helpMessage =
     , "  some text before the subject *"
     , "  as many pattern lines * in the pattern file as you want"
     , ""
-    , "Supported keys:" ++ intercalate "\n  " ("" : map showKey [minBound ..])
+    , "Supported keys:" ++ intercalate "\n  " ("" : map showKey finiteKeys ++ controlNetKeys)
     ]
  where
   showKey key = "\"" ++ keyToText key ++ "\""
+  finiteKeys =
+    [ KeyPositivePrompt
+    , KeyNegativePrompt
+    , KeySteps
+    , KeySampler
+    , KeyCFGScale
+    , KeySeed
+    , KeyFaceRestoration
+    , KeySize
+    , KeyModelHash
+    , KeyModel
+    , KeyClipSkip
+    , KeyCFGRescalePhi
+    , KeyLoraHashes
+    , KeyVersion
+    , KeyTemplate
+    , KeyNegativeTemplate
+    ]
+  controlNetKeys =
+    let cn = showKey (KeyControlNet Nothing)
+     in [cn, cn ++ " <n>"]
 
 parseCliOpts :: HasCallStack => [String] -> Either String CLIOpts
 parseCliOpts = go' <=< go emptyCliOpts
