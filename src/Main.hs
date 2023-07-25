@@ -229,9 +229,9 @@ stripSdExtension = \case
     ':' : argBegin ->
       let (arg, rest) = spanItem argBegin
        in go (arg : acc) rest
-    '>' : rest ->
-      let name : args = reverse $ map trim acc
-       in Just (rest, SDExtension name args)
+    '>' : rest -> case reverse $ map trim acc of
+      [] -> error "impossible?"
+      name : args -> Just (rest, SDExtension name args)
     _ -> Nothing
 
 -- Removes the extension encoding from the input string and returns the extensions.
@@ -366,7 +366,9 @@ viewNegativePrompt s = case isNegativePrompt s of
 readSize :: HasCallStack => String -> (Int, Int)
 readSize text = (myRead w, myRead h)
  where
-  (w, _ : h) = break (== 'x') text
+  (w, h) = case break (== 'x') text of
+    (w', _ : h') -> (w', h')
+    _ -> error $ "readSize: invalid size: " ++ show text
 
 readLoraHashes :: HasCallStack => String -> [(String, String)]
 readLoraHashes text = map readLoraHash $ splitOn "," text
@@ -374,7 +376,9 @@ readLoraHashes text = map readLoraHash $ splitOn "," text
 readLoraHash :: HasCallStack => String -> (String, String)
 readLoraHash text = (key, trim value)
  where
-  (key, _ : value) = break (== ':') text
+  (key, value) = case break (== ':') text of
+    (key', _ : value') -> (key', value')
+    _ -> error $ "readLoraHash: invalid lora hash: " ++ show text
 
 inlineSdExtensions :: HasCallStack => (String, [SDExtension]) -> String
 inlineSdExtensions (text, exts) = text ++ concatMap inlineSdExtension exts
@@ -730,12 +734,12 @@ forceEvalImage image = do
         | x >= w = go 0 (y + 1)
         | y >= h = pure ()
         | otherwise = do
-          let PixelRGBA8 r g b a = pixelAt image x y
-          _ <- evaluate r
-          _ <- evaluate g
-          _ <- evaluate b
-          _ <- evaluate a
-          go (x + 1) y
+            let PixelRGBA8 r g b a = pixelAt image x y
+            _ <- evaluate r
+            _ <- evaluate g
+            _ <- evaluate b
+            _ <- evaluate a
+            go (x + 1) y
   go 0 0
 
 forceEvalMetadatas :: HasCallStack => J.Metadatas -> IO ()
