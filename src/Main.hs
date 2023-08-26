@@ -270,13 +270,21 @@ stripSdWeightedText = \case
     _ -> Nothing
 
 -- Removes the weighted text encoding from the input string
-removeTextWeights :: HasCallStack => String -> String
-removeTextWeights = go ""
+removeTextWeights' :: HasCallStack => String -> String
+removeTextWeights' = go ""
  where
   go acc = \case
     (stripSdWeightedText -> Just (rest, weighted)) -> go (reverse (sdText weighted) ++ acc) rest
     (c : rest) -> go (c : acc) rest
     [] -> reverse acc
+
+-- This is done to work around `stripSdWeightedText` not handling nested weighted text
+removeTextWeights :: HasCallStack => String -> String
+removeTextWeights s = case s == s' of
+  True -> s
+  False -> removeTextWeights' s'
+  where
+    s' = removeTextWeights' s
 
 massageLines :: HasCallStack => String -> String
 massageLines = go
