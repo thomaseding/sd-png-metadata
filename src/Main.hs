@@ -4,9 +4,10 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
-{-# HLINT ignore "Replace case with fromMaybe" #-}
 {-# HLINT ignore "Redundant fmap" #-}
 {-# HLINT ignore "Redundant pure" #-}
+{-# HLINT ignore "Replace case with fromMaybe" #-}
+{-# HLINT ignore "Replace case with maybe" #-}
 {-# HLINT ignore "Use forM_" #-}
 {-# HLINT ignore "Use if" #-}
 
@@ -27,7 +28,13 @@ import Control.Monad (foldM, msum, when, (<=<))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (runMaybeT))
 import qualified Data.ByteString.Lazy.Char8 as BS
-import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf, partition, sort, stripPrefix)
+import Data.List (
+  foldl',
+  intercalate,
+  partition,
+  sort,
+  stripPrefix,
+ )
 import Data.List.Split (splitOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
@@ -283,8 +290,8 @@ removeTextWeights :: HasCallStack => String -> String
 removeTextWeights s = case s == s' of
   True -> s
   False -> removeTextWeights' s'
-  where
-    s' = removeTextWeights' s
+ where
+  s' = removeTextWeights' s
 
 massageLines :: HasCallStack => String -> String
 massageLines = go
@@ -774,13 +781,19 @@ readPatternPairs path = do
   let patterns = filter (not . null) $ map trim $ lines contents
   pure $ makePatternPairs patterns
 
+stripSuffix :: HasCallStack => String -> String -> Maybe String
+stripSuffix suffix = fmap reverse . stripPrefix (reverse suffix) . reverse
+
+stripPrefixAndSuffix :: HasCallStack => String -> String -> String -> Maybe String
+stripPrefixAndSuffix prefix suffix str = do
+  str' <- stripPrefix prefix str
+  stripSuffix suffix str'
+
 extractSubject :: HasCallStack => [(String, String)] -> String -> Maybe String
 extractSubject [] str = Just str
 extractSubject patternPairs str = msum do
   (prefix, suffix) <- patternPairs
-  let isMatch = isPrefixOf prefix str && isSuffixOf suffix str
-      subject = trim $ takeWhile (/= ',') $ drop (length prefix) (take (length str - length suffix) str)
-  pure if isMatch then Just subject else Nothing
+  pure $ stripPrefixAndSuffix prefix suffix str
 
 data DoSingle = DoSingle
   { oneInputImage :: FilePath
